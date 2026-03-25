@@ -1,0 +1,239 @@
+"""
+schedulers/main_scheduler.py
+APScheduler — semua job terjadwal dalam satu tempat.
+Timezone: Asia/Jakarta (WIB).
+"""
+
+from __future__ import annotations
+import asyncio
+import logging
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+import pytz
+
+from config.settings import settings
+
+log = logging.getLogger("scheduler")
+WIB = pytz.timezone("Asia/Jakarta")
+
+
+class BotScheduler:
+
+    def __init__(self):
+        self._scheduler = AsyncIOScheduler(timezone=WIB)
+        self._register_all_jobs()
+
+    def _register_all_jobs(self):
+        """Daftarkan semua job dengan jadwal masing-masing."""
+        s = self._scheduler
+
+        s.add_job(
+            self._wrap(self._seven_day_check),
+            IntervalTrigger(hours=6),
+            id="seven_day_check",
+            name="7-day live monitor (every 6h)",
+            max_instances=1,
+        )
+
+        # ── Setiap jam ────────────────────────────────────────────────
+        s.add_job(
+            self._wrap(self._update_news_outcomes),
+            IntervalTrigger(hours=1),
+            id="news_outcomes",
+            name="Update news outcomes",
+            max_instances=1,
+        )
+        s.add_job(
+            self._wrap(self._monitor_circuit_breaker),
+            IntervalTrigger(minutes=15),
+            id="circuit_breaker_check",
+            name="Circuit breaker monitor",
+            max_instances=1,
+        )
+
+        # ── Harian ────────────────────────────────────────────────────
+        s.add_job(
+            self._wrap(self._portfolio_snapshot),
+            CronTrigger(hour=0, minute=5, timezone=WIB),
+            id="portfolio_snapshot",
+            name="Portfolio snapshot 00:05 WIB",
+            max_instances=1,
+        )
+        s.add_job(
+            self._wrap(self._update_lrhr),
+            CronTrigger(hour=1, minute=0, timezone=WIB),
+            id="lrhr_update",
+            name="LRHR scores update 01:00 WIB",
+            max_instances=1,
+        )
+        s.add_job(
+            self._wrap(self._supabase_ping),
+            CronTrigger(hour=6, minute=0, timezone=WIB),
+            id="supabase_ping",
+            name="Supabase keep-alive 06:00 WIB",
+            max_instances=1,
+        )
+        s.add_job(
+            self._wrap(self._payment_reminder),
+            CronTrigger(hour=10, minute=0, timezone=WIB),
+            id="payment_reminder",
+            name="Payment reminder 10:00 WIB",
+            max_instances=1,
+        )
+        s.add_job(
+            self._wrap(self._daily_summary),
+            CronTrigger(hour=20, minute=0, timezone=WIB),
+            id="daily_summary",
+            name="Daily summary 20:00 WIB",
+            max_instances=1,
+        )
+
+        # ── Mingguan ──────────────────────────────────────────────────
+        s.add_job(
+            self._wrap(self._weekly_backtest),
+            CronTrigger(day_of_week="mon", hour=6, minute=0, timezone=WIB),
+            id="weekly_backtest",
+            name="Weekly backtest Senin 06:00 WIB",
+            max_instances=1,
+        )
+        s.add_job(
+            self._wrap(self._opus_evaluation),
+            CronTrigger(day_of_week="mon", hour=8, minute=0, timezone=WIB),
+            id="opus_evaluation",
+            name="Opus evaluation Senin 08:00 WIB",
+            max_instances=1,
+        )
+        s.add_job(
+            self._wrap(self._crash_test),
+            CronTrigger(day_of_week="sun", hour=22, minute=0, timezone=WIB),
+            id="crash_test",
+            name="Crash test Minggu 22:00 WIB",
+            max_instances=1,
+        )
+        s.add_job(
+            self._wrap(self._cleanup_news),
+            CronTrigger(day_of_week="sun", hour=1, minute=0, timezone=WIB),
+            id="news_cleanup",
+            name="News cleanup Minggu 01:00 WIB",
+            max_instances=1,
+        )
+
+        log.info(
+            "Scheduler: %d jobs registered",
+            len(s.get_jobs())
+        )
+
+    # ── Entry point ───────────────────────────────────────────────────
+
+    async def start(self):
+        """Jalankan scheduler — dipanggil dari main.py sebagai async task."""
+        self._scheduler.start()
+        log.info("Scheduler started (timezone: %s)", settings.BOT_TIMEZONE)
+
+        # Tetap hidup sampai di-stop
+        try:
+            while True:
+                await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            self._scheduler.shutdown(wait=False)
+            log.info("Scheduler stopped")
+
+    # ── Job wrappers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _wrap(coro_func):
+        """
+        Wrapper agar setiap job punya error handling dan logging.
+        APScheduler tidak async-native untuk error reporting.
+        """
+        async def _job():
+            name = coro_func.__name__.lstrip("_")
+            try:
+                log.debug("Job starting: %s", name)
+                await coro_func()
+                log.debug("Job done: %s", name)
+            except Exception as e:
+                log.error("Job error [%s]: %s", name, e, exc_info=True)
+                try:
+                    from database.client import db
+                    await db.log_event(
+                        "scheduler_job_error",
+                        f"Job {name} failed: {e}",
+                        severity="warning",
+                    )
+                except Exception:
+                    pass
+        return _job
+
+    # ── Individual job methods ────────────────────────────────────────
+
+    async def _seven_day_check(self):
+        from monitoring.seven_day_tracker import seven_day_tracker
+        await seven_day_tracker.run_check()
+
+    async def _portfolio_snapshot(self):
+        from schedulers.daily_tasks import take_portfolio_snapshot
+        await take_portfolio_snapshot()
+
+    async def _payment_reminder(self):
+        from schedulers.daily_tasks import run_payment_reminder
+        await run_payment_reminder()
+
+    async def _update_news_outcomes(self):
+        from schedulers.daily_tasks import update_news_outcomes
+        await update_news_outcomes()
+
+    async def _update_lrhr(self):
+        from schedulers.daily_tasks import update_lrhr_scores
+        await update_lrhr_scores()
+
+    async def _monitor_circuit_breaker(self):
+        from schedulers.daily_tasks import monitor_circuit_breaker
+        await monitor_circuit_breaker()
+
+    async def _supabase_ping(self):
+        from schedulers.daily_tasks import check_supabase_activity
+        await check_supabase_activity()
+
+    async def _daily_summary(self):
+        from schedulers.daily_tasks import send_daily_summary
+        await send_daily_summary()
+
+    async def _opus_evaluation(self):
+        from schedulers.weekly_tasks import run_opus_evaluation
+        await run_opus_evaluation()
+
+    async def _weekly_backtest(self):
+        from schedulers.weekly_tasks import run_weekly_backtest
+        await run_weekly_backtest()
+
+    async def _crash_test(self):
+        from schedulers.weekly_tasks import run_weekly_crash_test
+        await run_weekly_crash_test()
+
+    async def _cleanup_news(self):
+        from schedulers.weekly_tasks import cleanup_old_news
+        await cleanup_old_news()
+
+    # ── Debug helpers ─────────────────────────────────────────────────
+
+    def list_jobs(self) -> list[dict]:
+        """List semua job terjadwal — untuk /status debug."""
+        return [
+            {
+                "id":       job.id,
+                "name":     job.name,
+                "next_run": str(job.next_run_time),
+            }
+            for job in self._scheduler.get_jobs()
+        ]
+
+    async def run_job_now(self, job_id: str) -> bool:
+        """Paksa jalankan satu job sekarang — untuk testing."""
+        job = self._scheduler.get_job(job_id)
+        if job:
+            await job.func()
+            return True
+        return False

@@ -1,0 +1,93 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
+
+:root {
+  /* Core palette */
+  --bg-void:     #080c10;
+  --bg-deep:     #0d1117;
+  --bg-base:     #111820;
+  --bg-surface:  #161e28;
+  --bg-elevated: #1c2635;
+  --bg-hover:    #22303f;
+
+  /* Borders */
+  --border-dim:  rgba(255,255,255,0.04);
+  --border-soft: rgba(255,255,255,0.08);
+  --border-mid:  rgba(255,255,255,0.14);
+
+  /* Text */
+  --text-primary:   #e8edf3;
+  --text-secondary: #8b98a8;
+  --text-muted:     #4a5568;
+  --text-dim:       #2d3748;
+
+  /* Accent — electric teal */
+  --accent:       #00d4aa;
+  --accent-dim:   rgba(0,212,170,0.12);
+  --accent-glow:  rgba(0,212,170,0.25);
+
+  /* Semantic */
+  --green:      #00d4aa;
+  --green-dim:  rgba(0,212,170,0.15);
+  --red:        #ff4757;
+  --red-dim:    rgba(255,71,87,0.15);
+  --yellow:     #ffd32a;
+  --yellow-dim: rgba(255,211,42,0.15);
+  --blue:       #4fc3f7;
+  --blue-dim:   rgba(79,195,247,0.15);
+  --purple:     #a78bfa;
+  --purple-dim: rgba(167,139,250,0.15);
+
+  /* Chart colors */
+  --candle-up:   #00d4aa;
+  --candle-down: #ff4757;
+  --vol-up:      rgba(0,212,170,0.4);
+  --vol-down:    rgba(255,71,87,0.4);
+
+  /* Typography */
+  --font-mono: 'JetBrains Mono', monospace;
+  --font-ui:   'Space Grotesk', sans-serif;
+
+  /* Sizing */
+  --sidebar-w: 220px;
+  --header-h:  52px;
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #root {
+  height: 100%;
+  background: var(--bg-void);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-mid); border-radius: 2px; }
+
+/* Utility */
+.mono { font-family: var(--font-mono); }
+.up   { color: var(--green); }
+.down { color: var(--red); }
+.muted { color: var(--text-muted); }
+
+/* Animated scan line overlay */
+@keyframes scanline {
+  0%   { transform: translateY(-100%); }
+  100% { transform: translateY(100vh); }
+}
+
+/* Pulse dot */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.4; transform: scale(0.8); }
+}
+
+/* Number ticker */
+@keyframes flash-green { 0%,100% { color: var(--text-primary); } 50% { color: var(--green); } }
+@keyframes flash-red   { 0%,100% { color: var(--text-primary); } 50% { color: var(--red);   } }

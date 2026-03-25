@@ -1,0 +1,48 @@
+# Web framework & server
+fastapi==0.135.1
+uvicorn[standard]==0.34.0
+
+# Bybit exchange
+pybit==5.14.0
+
+# Anthropic Claude
+anthropic==0.86.0
+
+# Telegram bot
+python-telegram-bot==22.7
+
+# Database
+supabase==2.15.1
+
+# Cache & state
+redis==5.2.1
+
+# Scheduler
+apscheduler==3.11.0
+# pytz tidak diperlukan lagi — python-telegram-bot v22+ deprecated pytz,
+# gunakan zoneinfo (built-in Python 3.9+)
+
+# Technical analysis
+# pandas-ta original tidak tersedia — pakai pandas-ta-classic (community fork resmi)
+pandas-ta-classic==0.4.47
+pandas==2.2.3
+numpy==2.2.4
+
+# Backtesting
+vectorbt==0.28.4
+
+# News fetching
+feedparser==6.0.11
+httpx==0.28.1
+
+# Data validation
+pydantic==2.11.1
+pydantic-settings==2.8.1
+
+# Utils
+python-dotenv==1.1.0
+python-dateutil==2.9.0.post0
+
+# Testing
+pytest==8.3.5
+pytest-asyncio==0.25.3

@@ -1,0 +1,20 @@
+{
+  "name": "crypto-bot-dashboard",
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {
+    "dev":     "vite",
+    "build":   "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react":         "^18.3.1",
+    "react-dom":     "^18.3.1",
+    "recharts":      "^2.13.0",
+    "date-fns":      "^3.6.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite":                 "^5.4.3"
+  }
+}

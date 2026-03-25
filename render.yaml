@@ -1,0 +1,54 @@
+services:
+  - type: web
+    name: crypto-bot
+    runtime: python
+    region: singapore
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+
+    envVars:
+      # ── Bybit ──────────────────────────────────────────────
+      - key: BYBIT_API_KEY
+        sync: false
+      - key: BYBIT_API_SECRET
+        sync: false
+      - key: BYBIT_TESTNET
+        value: "false"
+
+      # ── Anthropic ──────────────────────────────────────────
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ANTHROPIC_SPENDING_LIMIT
+        value: "30"
+
+      # ── Telegram ───────────────────────────────────────────
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+
+      # ── Database ───────────────────────────────────────────
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: REDIS_URL
+        sync: false
+
+      # ── Auth ───────────────────────────────────────────────
+      - key: BOT_PIN_HASH
+        sync: false
+
+      # ── Bot config ─────────────────────────────────────────
+      - key: BOT_TIMEZONE
+        value: "Asia/Jakarta"
+      - key: PAPER_TRADE
+        value: "true"
+      - key: INITIAL_CAPITAL
+        value: "213"
+
+      # ── Render billing ─────────────────────────────────────
+      - key: RENDER_BILLING_DAY
+        value: "1"

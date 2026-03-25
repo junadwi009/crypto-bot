@@ -1,0 +1,41 @@
+{
+  "global": {
+    "rsi_period": 14,
+    "rsi_oversold": 32,
+    "rsi_overbought": 71,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "bb_period": 20,
+    "bb_std": 2.0,
+    "stop_loss_pct": 2.2,
+    "take_profit_pct": 4.5,
+    "atr_period": 14,
+    "atr_no_trade_threshold": 0.8,
+    "position_multiplier": 1.0,
+    "volume_ratio_min": 1.2,
+    "note": "Parameter global — berlaku untuk semua pair kecuali ada override"
+  },
+  "BTC/USDT": {
+    "stop_loss_pct": 2.2,
+    "take_profit_pct": 4.5,
+    "position_multiplier": 1.15,
+    "note": "BTC override — multiplier lebih tinggi karena win rate konsisten"
+  },
+  "SOL/USDT": {
+    "stop_loss_pct": 3.0,
+    "take_profit_pct": 6.0,
+    "atr_no_trade_threshold": 1.2,
+    "note": "SOL lebih volatil — stop loss lebih lebar"
+  },
+  "lrhr_weights": {
+    "sharpe":   0.25,
+    "winrate":  0.20,
+    "drawdown": 0.20,
+    "news":     0.20,
+    "onchain":  0.15,
+    "note": "Bobot scoring LRHR — Opus update ini setiap minggu"
+  },
+  "last_updated": "2026-03-24",
+  "updated_by": "manual"
+}

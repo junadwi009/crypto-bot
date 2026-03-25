@@ -1,0 +1,84 @@
+{
+  "pairs": [
+    {
+      "pair": "BTC/USDT",
+      "active": true,
+      "strategy": "rsi_momentum",
+      "category": "Layer1",
+      "max_allocation_pct": 100,
+      "min_capital_required": 50,
+      "note": "Pair utama — aktif dari tier Seed"
+    },
+    {
+      "pair": "ETH/USDT",
+      "active": false,
+      "strategy": "rsi_momentum",
+      "category": "Layer1",
+      "max_allocation_pct": 40,
+      "min_capital_required": 300,
+      "note": "Aktif mulai tier Growth"
+    },
+    {
+      "pair": "SOL/USDT",
+      "active": false,
+      "strategy": "rsi_momentum",
+      "category": "Layer1",
+      "max_allocation_pct": 20,
+      "min_capital_required": 500,
+      "note": "Aktif mulai tier Growth lanjut"
+    },
+    {
+      "pair": "BNB/USDT",
+      "active": false,
+      "strategy": "rsi_momentum",
+      "category": "Layer1",
+      "max_allocation_pct": 15,
+      "min_capital_required": 700,
+      "note": "Aktif mulai tier Pro"
+    },
+    {
+      "pair": "AVAX/USDT",
+      "active": false,
+      "strategy": "rsi_momentum",
+      "category": "Layer1",
+      "max_allocation_pct": 10,
+      "min_capital_required": 900,
+      "note": "Aktif mulai tier Pro lanjut"
+    },
+    {
+      "pair": "UNI/USDT",
+      "active": false,
+      "strategy": "news_driven",
+      "category": "DeFi",
+      "max_allocation_pct": 8,
+      "min_capital_required": 1200,
+      "note": "DeFi token — news-driven strategy"
+    },
+    {
+      "pair": "LINK/USDT",
+      "active": false,
+      "strategy": "rsi_momentum",
+      "category": "Oracle",
+      "max_allocation_pct": 7,
+      "min_capital_required": 1500,
+      "note": "Aktif mulai tier Elite"
+    },
+    {
+      "pair": "ARB/USDT",
+      "active": false,
+      "strategy": "rsi_momentum",
+      "category": "L2",
+      "max_allocation_pct": 5,
+      "min_capital_required": 1800,
+      "note": "L2 token — aktif di Elite penuh"
+    }
+  ],
+  "category_caps": {
+    "Layer1": 0.60,
+    "DeFi":   0.20,
+    "L2":     0.15,
+    "Oracle": 0.10
+  },
+  "max_correlation": 0.85,
+  "last_updated": "2026-03-24"
+}
