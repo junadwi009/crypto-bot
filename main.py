@@ -16,6 +16,7 @@ import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from config.settings import settings
@@ -141,6 +142,21 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
 app.include_router(dashboard_router)
+
+# CORS — izinkan frontend Render akses API
+# Ganti URL setelah deploy frontend ke Render
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",           # dev lokal
+    "http://localhost:4173",           # vite preview
+    f"https://{settings.FRONTEND_URL}" if hasattr(settings, "FRONTEND_URL") and settings.FRONTEND_URL else "",
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins     = [o for o in ALLOWED_ORIGINS if o],
+    allow_credentials = True,
+    allow_methods     = ["GET"],
+    allow_headers     = ["*"],
+)
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):

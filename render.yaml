@@ -1,9 +1,11 @@
 services:
+  # ── Backend: Python bot ────────────────────────────────────
   - type: web
-    name: crypto-bot
+    name: crypto-bot-api
     runtime: python
     region: singapore
     plan: starter
+    rootDir: .
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     healthCheckPath: /health
@@ -52,3 +54,36 @@ services:
       # ── Render billing ─────────────────────────────────────
       - key: RENDER_BILLING_DAY
         value: "1"
+
+  # ── Frontend: React dashboard ──────────────────────────────
+  - type: web
+    name: crypto-bot-dashboard
+    runtime: static
+    region: singapore
+    rootDir: frontend-v2
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    pullRequestPreviewsEnabled: false
+
+    headers:
+      - path: /*
+        name: X-Robots-Tag
+        value: noindex, nofollow, noarchive
+      - path: /*
+        name: X-Frame-Options
+        value: DENY
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Cache-Control
+        value: no-store, no-cache
+
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
+    envVars:
+      - key: VITE_API_URL
+        sync: false
