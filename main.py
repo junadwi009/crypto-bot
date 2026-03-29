@@ -161,9 +161,9 @@ app.add_middleware(
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
-    response.headers["X-Robots-Tag"]       = "noindex, nofollow, noarchive"
+    response.headers["X-Robots-Tag"]           = "noindex, nofollow, noarchive"
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"]    = "DENY"
+    response.headers["X-Frame-Options"]        = "DENY"
     return response
 
 @app.get("/health")
@@ -211,7 +211,20 @@ async def main():
     await redis.delete("bot_paused")
     log.info("Startup flags cleared")
 
-    # 3. Koneksi Bybit (non-fatal saat lokal — Bybit bisa diblokir ISP)
+    # 3. FIX: Drop webhook & pending updates saat startup
+    # Mencegah Conflict error saat Render restart instance baru
+    # sebelum instance lama benar-benar mati
+    try:
+        await telegram.app.bot.delete_webhook(drop_pending_updates=True)
+        log.info("Telegram webhook cleared — conflict prevention OK")
+    except Exception as e:
+        log.warning("Could not clear Telegram webhook (non-fatal): %s", e)
+
+    # Tambahan jeda kecil setelah delete webhook
+    # agar Telegram server sempat menutup koneksi polling lama
+    await asyncio.sleep(2)
+
+    # 4. Koneksi Bybit (non-fatal saat lokal — Bybit bisa diblokir ISP)
     try:
         await bybit.ping()
         log.info("Bybit: connected")
@@ -222,7 +235,7 @@ async def main():
             log.critical("Bybit ping failed in LIVE mode — stopping bot")
             raise
 
-    # 4. Notif startup ke Telegram
+    # 5. Notif startup ke Telegram
     mode = "PAPER TRADE" if settings.PAPER_TRADE else "LIVE TRADING"
     await telegram.send(
         f"Bot started\n"
@@ -231,19 +244,19 @@ async def main():
         f"Timezone: WIB (Asia/Jakarta)"
     )
 
-    # 5. Inisialisasi scheduler
+    # 6. Inisialisasi scheduler
     scheduler = BotScheduler()
 
-    # 6. Start semua async tasks secara paralel
+    # 7. Start semua async tasks secara paralel
     tasks = [
-        asyncio.create_task(trading_loop(),         name="trading"),
-        asyncio.create_task(news_loop(),             name="news"),
-        asyncio.create_task(credit_monitor_loop(),   name="credit"),
-        asyncio.create_task(telegram.run(),          name="telegram"),
-        asyncio.create_task(scheduler.start(),       name="scheduler"),
+        asyncio.create_task(trading_loop(),       name="trading"),
+        asyncio.create_task(news_loop(),           name="news"),
+        asyncio.create_task(credit_monitor_loop(), name="credit"),
+        asyncio.create_task(telegram.run(),        name="telegram"),
+        asyncio.create_task(scheduler.start(),     name="scheduler"),
     ]
 
-    # 7. Handle SIGTERM dari Render (Linux only — Windows tidak support add_signal_handler)
+    # 8. Handle SIGTERM dari Render (Linux only — Windows tidak support add_signal_handler)
     loop = asyncio.get_event_loop()
 
     def handle_signal():
@@ -260,7 +273,7 @@ async def main():
         _signal.signal(_signal.SIGINT,  lambda s, f: asyncio.create_task(graceful_shutdown(tasks)))
         _signal.signal(_signal.SIGTERM, lambda s, f: asyncio.create_task(graceful_shutdown(tasks)))
 
-    # 8. Health check server (FastAPI + uvicorn)
+    # 9. Health check server (FastAPI + uvicorn)
     config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="warning")
     server = uvicorn.Server(config)
     tasks.append(asyncio.create_task(server.serve(), name="health"))
