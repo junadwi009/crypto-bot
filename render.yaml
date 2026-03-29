@@ -11,6 +11,11 @@ services:
     healthCheckPath: /health
 
     envVars:
+      # FIX: Pin Python 3.11.9 agar Render tidak pakai Python 3.14 (bleeding edge)
+      # yang belum punya pre-built wheel untuk banyak package
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+
       # ── Bybit ──────────────────────────────────────────────
       - key: BYBIT_API_KEY
         sync: false
