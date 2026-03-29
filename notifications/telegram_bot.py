@@ -26,6 +26,7 @@ class TelegramBot:
     def __init__(self):
         self._app: Application | None = None
         self._bot: Bot | None = None
+        self._stop_event: asyncio.Event | None = None
 
     def _get_app(self) -> Application:
         if self._app is None:
@@ -64,16 +65,46 @@ class TelegramBot:
     async def run(self):
         """Jalankan bot polling — dipanggil dari main.py sebagai async task."""
         log.info("Telegram bot starting polling...")
+
+        # FIX: Delete webhook dulu sebelum mulai polling
+        # Ini mencegah conflict saat Render restart — instance lama
+        # belum mati, instance baru sudah start polling
+        try:
+            bot = self._get_bot()
+            await bot.delete_webhook(drop_pending_updates=True)
+            log.info("Telegram: webhook cleared before polling")
+        except Exception as e:
+            log.warning("Telegram: could not clear webhook (non-fatal): %s", e)
+
+        # Jeda singkat agar Telegram server tutup koneksi polling lama
+        await asyncio.sleep(3)
+
         app = self._get_app()
+        self._stop_event = asyncio.Event()
+
         async with app:
             await app.start()
             await app.updater.start_polling(
                 allowed_updates=["message", "callback_query"],
                 drop_pending_updates=True,
             )
-            # Tunggu sampai di-stop dari luar
-            while True:
-                await asyncio.sleep(1)
+            log.info("Telegram bot polling active")
+
+            # FIX: Tunggu stop_event — bukan while True sleep
+            # Sehingga saat task di-cancel, bot bisa stop dengan bersih
+            try:
+                await self._stop_event.wait()
+            except asyncio.CancelledError:
+                log.info("Telegram polling task cancelled — stopping...")
+            finally:
+                await app.updater.stop()
+                await app.stop()
+                log.info("Telegram bot stopped cleanly")
+
+    async def stop(self):
+        """Hentikan polling dari luar (dipanggil saat graceful shutdown)."""
+        if self._stop_event:
+            self._stop_event.set()
 
     # ── Send methods ──────────────────────────────────────────────────────
 

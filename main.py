@@ -123,7 +123,10 @@ async def graceful_shutdown(tasks: list):
     except Exception:
         pass
 
-    await asyncio.sleep(5)
+    # FIX: Stop telegram polling dulu sebelum cancel tasks
+    # Ini memastikan koneksi polling ke Telegram ditutup dengan bersih
+    await telegram.stop()
+    await asyncio.sleep(2)
 
     for task in tasks:
         if not task.done():
@@ -144,10 +147,9 @@ app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
 app.include_router(dashboard_router)
 
 # CORS — izinkan frontend Render akses API
-# Ganti URL setelah deploy frontend ke Render
 ALLOWED_ORIGINS = [
-    "http://localhost:5173",           # dev lokal
-    "http://localhost:4173",           # vite preview
+    "http://localhost:5173",
+    "http://localhost:4173",
     f"https://{settings.FRONTEND_URL}" if hasattr(settings, "FRONTEND_URL") and settings.FRONTEND_URL else "",
 ]
 app.add_middleware(
@@ -211,20 +213,7 @@ async def main():
     await redis.delete("bot_paused")
     log.info("Startup flags cleared")
 
-    # 3. FIX: Drop webhook & pending updates saat startup
-    # Mencegah Conflict error saat Render restart instance baru
-    # sebelum instance lama benar-benar mati
-    try:
-        await telegram.app.bot.delete_webhook(drop_pending_updates=True)
-        log.info("Telegram webhook cleared — conflict prevention OK")
-    except Exception as e:
-        log.warning("Could not clear Telegram webhook (non-fatal): %s", e)
-
-    # Tambahan jeda kecil setelah delete webhook
-    # agar Telegram server sempat menutup koneksi polling lama
-    await asyncio.sleep(2)
-
-    # 4. Koneksi Bybit (non-fatal saat lokal — Bybit bisa diblokir ISP)
+    # 3. Koneksi Bybit (non-fatal saat lokal — Bybit bisa diblokir ISP)
     try:
         await bybit.ping()
         log.info("Bybit: connected")
@@ -235,7 +224,7 @@ async def main():
             log.critical("Bybit ping failed in LIVE mode — stopping bot")
             raise
 
-    # 5. Notif startup ke Telegram
+    # 4. Notif startup ke Telegram
     mode = "PAPER TRADE" if settings.PAPER_TRADE else "LIVE TRADING"
     await telegram.send(
         f"Bot started\n"
@@ -244,10 +233,10 @@ async def main():
         f"Timezone: WIB (Asia/Jakarta)"
     )
 
-    # 6. Inisialisasi scheduler
+    # 5. Inisialisasi scheduler
     scheduler = BotScheduler()
 
-    # 7. Start semua async tasks secara paralel
+    # 6. Start semua async tasks secara paralel
     tasks = [
         asyncio.create_task(trading_loop(),       name="trading"),
         asyncio.create_task(news_loop(),           name="news"),
@@ -256,7 +245,7 @@ async def main():
         asyncio.create_task(scheduler.start(),     name="scheduler"),
     ]
 
-    # 8. Handle SIGTERM dari Render (Linux only — Windows tidak support add_signal_handler)
+    # 7. Handle SIGTERM dari Render
     loop = asyncio.get_event_loop()
 
     def handle_signal():
@@ -268,12 +257,11 @@ async def main():
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, handle_signal)
     else:
-        # Windows: pakai signal.signal biasa (sync, tapi cukup untuk Ctrl+C lokal)
         import signal as _signal
         _signal.signal(_signal.SIGINT,  lambda s, f: asyncio.create_task(graceful_shutdown(tasks)))
         _signal.signal(_signal.SIGTERM, lambda s, f: asyncio.create_task(graceful_shutdown(tasks)))
 
-    # 9. Health check server (FastAPI + uvicorn)
+    # 8. Health check server (FastAPI + uvicorn)
     config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="warning")
     server = uvicorn.Server(config)
     tasks.append(asyncio.create_task(server.serve(), name="health"))
