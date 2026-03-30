@@ -66,18 +66,14 @@ class TelegramBot:
         """Jalankan bot polling — dipanggil dari main.py sebagai async task."""
         log.info("Telegram bot starting polling...")
 
-        # FIX: Delete webhook dulu sebelum mulai polling
-        # Ini mencegah conflict saat Render restart — instance lama
-        # belum mati, instance baru sudah start polling
-        try:
-            bot = self._get_bot()
-            await bot.delete_webhook(drop_pending_updates=True)
-            log.info("Telegram: webhook cleared before polling")
-        except Exception as e:
-            log.warning("Telegram: could not clear webhook (non-fatal): %s", e)
+        # Step 1: Hapus webhook — wajib sebelum polling
+        await self._clear_webhook_with_retry()
 
-        # Jeda singkat agar Telegram server tutup koneksi polling lama
-        await asyncio.sleep(3)
+        # Step 2: Jeda lebih panjang agar Telegram server benar-benar
+        # menutup koneksi getUpdates dari instance lama.
+        # Render rolling deploy butuh ~10–15 detik overlap window.
+        log.info("Telegram: waiting 15s for old instance to disconnect...")
+        await asyncio.sleep(15)
 
         app = self._get_app()
         self._stop_event = asyncio.Event()
@@ -87,11 +83,15 @@ class TelegramBot:
             await app.updater.start_polling(
                 allowed_updates=["message", "callback_query"],
                 drop_pending_updates=True,
+                # Timeout lebih pendek agar conflict cepat terdeteksi
+                # dan polling bisa restart lebih cepat
+                read_timeout=10,
+                write_timeout=10,
+                connect_timeout=10,
+                pool_timeout=10,
             )
             log.info("Telegram bot polling active")
 
-            # FIX: Tunggu stop_event — bukan while True sleep
-            # Sehingga saat task di-cancel, bot bisa stop dengan bersih
             try:
                 await self._stop_event.wait()
             except asyncio.CancelledError:
@@ -100,6 +100,45 @@ class TelegramBot:
                 await app.updater.stop()
                 await app.stop()
                 log.info("Telegram bot stopped cleanly")
+
+    async def _clear_webhook_with_retry(self, max_attempts: int = 5):
+        """
+        Hapus webhook + tunggu sampai Telegram konfirmasi tidak ada
+        polling aktif. Retry dengan exponential backoff.
+        delete_webhook() tidak memutus getUpdates yang sedang berjalan —
+        kita perlu poll sekali dengan timeout=0 untuk 'mengambil alih'
+        lalu biarkan instance lama timeout sendiri.
+        """
+        for attempt in range(1, max_attempts + 1):
+            try:
+                bot = self._get_bot()
+                await bot.delete_webhook(drop_pending_updates=True)
+                log.info("Telegram: webhook cleared (attempt %d)", attempt)
+
+                # Lakukan satu getUpdates dengan timeout=0 untuk memaksa
+                # Telegram memutus koneksi polling instance lama
+                try:
+                    await bot.get_updates(offset=-1, timeout=0,
+                                          allowed_updates=["message"])
+                    log.info("Telegram: old polling connection displaced")
+                except Exception:
+                    # Error di sini adalah normal — instance lama mungkin
+                    # langsung conflict balik, tapi kita sudah 'menang'
+                    pass
+
+                return  # Berhasil — lanjut
+
+            except Exception as e:
+                wait = 2 ** attempt  # 2, 4, 8, 16, 32 detik
+                log.warning(
+                    "Telegram: webhook clear failed (attempt %d/%d): %s — "
+                    "retrying in %ds",
+                    attempt, max_attempts, e, wait
+                )
+                await asyncio.sleep(wait)
+
+        log.error("Telegram: could not clear webhook after %d attempts — "
+                  "proceeding anyway", max_attempts)
 
     async def stop(self):
         """Hentikan polling dari luar (dipanggil saat graceful shutdown)."""

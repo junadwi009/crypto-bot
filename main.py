@@ -123,10 +123,12 @@ async def graceful_shutdown(tasks: list):
     except Exception:
         pass
 
-    # FIX: Stop telegram polling dulu sebelum cancel tasks
-    # Ini memastikan koneksi polling ke Telegram ditutup dengan bersih
+    # Stop telegram polling dulu sebelum cancel tasks lain.
+    # Beri waktu cukup agar koneksi getUpdates ke Telegram server
+    # benar-benar ditutup — mencegah "Conflict" di instance baru.
     await telegram.stop()
-    await asyncio.sleep(2)
+    log.info("Waiting for Telegram polling to fully disconnect...")
+    await asyncio.sleep(10)
 
     for task in tasks:
         if not task.done():

@@ -10,6 +10,11 @@ services:
     startCommand: python main.py
     healthCheckPath: /health
 
+    # Beri waktu 30 detik untuk graceful shutdown sebelum Render force-kill.
+    # Ini memastikan instance lama sempat stop Telegram polling
+    # sebelum instance baru mulai. Default Render hanya 10 detik.
+    gracefulShutdownTimeoutSeconds: 30
+
     envVars:
       # FIX: Pin Python 3.11.9 agar Render tidak pakai Python 3.14 (bleeding edge)
       # yang belum punya pre-built wheel untuk banyak package
