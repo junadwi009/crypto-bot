@@ -11,6 +11,7 @@ Entry point. Menjalankan semua service secara paralel:
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 from contextlib import asynccontextmanager
@@ -148,18 +149,24 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
 app.include_router(dashboard_router)
 
-# CORS — izinkan frontend Render akses API
+# CORS — izinkan frontend Vercel akses API
+# Set FRONTEND_URL di env Render dengan domain Vercel kamu
+# Contoh: nama-project.vercel.app (tanpa https://)
+_frontend_url = os.getenv("FRONTEND_URL", "")
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://localhost:4173",
-    f"https://{settings.FRONTEND_URL}" if hasattr(settings, "FRONTEND_URL") and settings.FRONTEND_URL else "",
+    f"https://{_frontend_url}" if _frontend_url else "",
+    # Support preview deployments Vercel (*.vercel.app)
+    # dengan pattern matching — ditangani oleh allow_origin_regex di bawah
 ]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins     = [o for o in ALLOWED_ORIGINS if o],
-    allow_credentials = True,
-    allow_methods     = ["GET"],
-    allow_headers     = ["*"],
+    allow_origins      = [o for o in ALLOWED_ORIGINS if o],
+    allow_origin_regex = r"https://.*\.vercel\.app",
+    allow_credentials  = True,
+    allow_methods      = ["GET"],
+    allow_headers      = ["*"],
 )
 
 @app.middleware("http")
