@@ -33,6 +33,12 @@ class TelegramBot:
             self._app = (
                 Application.builder()
                 .token(settings.TELEGRAM_BOT_TOKEN)
+                # Timeout diset di sini (bukan di start_polling)
+                # agar conflict cepat terdeteksi dan polling bisa restart
+                .read_timeout(10)
+                .write_timeout(10)
+                .connect_timeout(10)
+                .pool_timeout(10)
                 .build()
             )
             self._register_handlers()
@@ -83,12 +89,6 @@ class TelegramBot:
             await app.updater.start_polling(
                 allowed_updates=["message", "callback_query"],
                 drop_pending_updates=True,
-                # Timeout lebih pendek agar conflict cepat terdeteksi
-                # dan polling bisa restart lebih cepat
-                read_timeout=10,
-                write_timeout=10,
-                connect_timeout=10,
-                pool_timeout=10,
             )
             log.info("Telegram bot polling active")
 
