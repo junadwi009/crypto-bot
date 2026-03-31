@@ -125,11 +125,13 @@ async def graceful_shutdown(tasks: list):
         pass
 
     # Stop telegram polling dulu sebelum cancel tasks lain.
-    # Beri waktu cukup agar koneksi getUpdates ke Telegram server
-    # benar-benar ditutup — mencegah "Conflict" di instance baru.
+    # telegram.stop() sekarang juga melepas deploy lock di Redis,
+    # sehingga instance baru bisa langsung mulai polling.
     await telegram.stop()
-    log.info("Waiting for Telegram polling to fully disconnect...")
-    await asyncio.sleep(10)
+    log.info("Telegram polling stopped and deploy lock released")
+
+    # Beri waktu 3 detik agar koneksi getUpdates benar-benar terputus
+    await asyncio.sleep(3)
 
     for task in tasks:
         if not task.done():

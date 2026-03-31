@@ -72,14 +72,16 @@ class TelegramBot:
         """Jalankan bot polling — dipanggil dari main.py sebagai async task."""
         log.info("Telegram bot starting polling...")
 
-        # Step 1: Hapus webhook — wajib sebelum polling
+        # Step 1: Tunggu sampai instance lama benar-benar mati.
+        # Menggunakan Redis lock agar tidak ada 2 instance polling bersamaan.
+        await self._wait_for_deploy_lock()
+
+        # Step 2: Hapus webhook — wajib sebelum polling
         await self._clear_webhook_with_retry()
 
-        # Step 2: Jeda lebih panjang agar Telegram server benar-benar
-        # menutup koneksi getUpdates dari instance lama.
-        # Render rolling deploy butuh ~10–15 detik overlap window.
-        log.info("Telegram: waiting 15s for old instance to disconnect...")
-        await asyncio.sleep(15)
+        # Step 3: Jeda singkat agar Telegram server menutup koneksi lama
+        log.info("Telegram: waiting 5s for Telegram server to release old connection...")
+        await asyncio.sleep(5)
 
         app = self._get_app()
         self._stop_event = asyncio.Event()
@@ -100,6 +102,42 @@ class TelegramBot:
                 await app.updater.stop()
                 await app.stop()
                 log.info("Telegram bot stopped cleanly")
+
+    async def _wait_for_deploy_lock(self, timeout: int = 60):
+        """
+        Gunakan Redis sebagai deployment lock.
+        - Instance lama set 'tg_polling_active' dengan TTL 60 detik saat shutdown.
+        - Instance baru tunggu sampai key itu expire / hilang.
+        - Setelah itu, instance baru set key tersebut untuk dirinya sendiri.
+        Ini mencegah 2 instance polling Telegram bersamaan.
+        """
+        from utils.redis_client import redis
+
+        lock_key = "tg_polling_active"
+        waited = 0
+        interval = 3
+
+        while waited < timeout:
+            lock = await redis.get(lock_key)
+            if not lock:
+                break
+            log.info(
+                "Telegram: deploy lock active (old instance still running) — "
+                "waiting... (%ds/%ds)", waited, timeout
+            )
+            await asyncio.sleep(interval)
+            waited += interval
+
+        if waited >= timeout:
+            log.warning(
+                "Telegram: deploy lock timeout after %ds — "
+                "forcing start (old instance may have crashed)", timeout
+            )
+
+        # Klaim lock untuk instance ini — TTL 120 detik sebagai safety net.
+        # Di-refresh saat polling aktif atau dihapus saat shutdown.
+        await redis.setex(lock_key, 120, "1")
+        log.info("Telegram: deploy lock acquired — this instance owns polling")
 
     async def _clear_webhook_with_retry(self, max_attempts: int = 5):
         """
@@ -142,6 +180,14 @@ class TelegramBot:
 
     async def stop(self):
         """Hentikan polling dari luar (dipanggil saat graceful shutdown)."""
+        # Release deploy lock agar instance baru bisa langsung mulai polling
+        try:
+            from utils.redis_client import redis
+            await redis.delete("tg_polling_active")
+            log.info("Telegram: deploy lock released")
+        except Exception as e:
+            log.warning("Telegram: failed to release deploy lock: %s", e)
+
         if self._stop_event:
             self._stop_event.set()
 
