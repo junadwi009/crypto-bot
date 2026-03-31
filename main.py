@@ -113,10 +113,6 @@ async def graceful_shutdown(tasks: list):
     _stopping = True
 
     log.info("Graceful shutdown initiated")
-    # Gunakan TTL 60 detik — flag ini hanya untuk instance INI.
-    # Kalau instance baru sudah start, flag ini akan expire sendiri
-    # sehingga tidak "meracuni" instance baru.
-    await redis.setex("bot_stopping", 60, "1")
 
     try:
         await telegram.send(
@@ -184,9 +180,8 @@ async def add_security_headers(request: Request, call_next):
 async def health():
     """Render.com health check endpoint — dipanggil setiap 30 detik."""
     paused   = bool(await redis.get("bot_paused"))
-    stopping = bool(await redis.get("bot_stopping"))
     return {
-        "status":      "stopping" if stopping else "paused" if paused else "ok",
+        "status":      "stopping" if _stopping else "paused" if paused else "ok",
         "paper_trade": settings.PAPER_TRADE,
         "tier":        await db.get_current_tier(),
     }
@@ -274,9 +269,9 @@ async def main():
     tasks.append(asyncio.create_task(server.serve(), name="health"))
 
     # 9. Clear flags SETELAH semua service running.
-    # Ini harus di sini (bukan di awal startup) karena ada race condition:
-    # instance lama bisa set "bot_stopping" SETELAH instance baru clear di awal.
-    # Dengan clear di sini, kita pastikan flag dari instance lama ditimpa.
+    # Clear stale Redis flags dari instance sebelumnya.
+    # bot_stopping tidak lagi disimpan di Redis (pakai in-memory _stopping),
+    # tapi kita tetap hapus untuk membersihkan sisa dari versi kode lama.
     await redis.delete("bot_stopping")
     await redis.delete("bot_paused")
     log.info("Startup flags cleared — all services running, bot is active")

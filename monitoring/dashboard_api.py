@@ -46,8 +46,11 @@ async def bot_status():
     open_trades  = await db.get_open_trades(is_paper=settings.PAPER_TRADE)
     daily_pnl    = await db.get_total_pnl(days=1)
     is_paused    = bool(await redis.get("bot_paused"))
-    is_stopping  = bool(await redis.get("bot_stopping"))
     claude_mode  = await redis.get("claude_mode") or "normal"
+
+    # Import in-memory _stopping flag dari main — lebih reliable
+    # daripada Redis karena tidak ada race condition antar instance.
+    from main import _stopping as is_stopping
 
     from engine.circuit_breaker import circuit_breaker
     cb_status    = await circuit_breaker.get_status()
