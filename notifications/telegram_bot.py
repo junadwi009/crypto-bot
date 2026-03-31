@@ -69,75 +69,98 @@ class TelegramBot:
         ))
 
     async def run(self):
-        """Jalankan bot polling — dipanggil dari main.py sebagai async task."""
+        """
+        Jalankan bot polling — dipanggil dari main.py sebagai async task.
+
+        Strategi anti-Conflict:
+        python-telegram-bot menangani Conflict error secara internal di
+        network loop — error TIDAK naik sebagai exception ke caller.
+        Jadi kita pakai error_callback di start_polling() untuk mendeteksi
+        Conflict, lalu restart polling otomatis.
+
+        Instance lama di Render pasti mati dalam 30 detik
+        (gracefulShutdownTimeoutSeconds), jadi retry ini PASTI berhasil.
+        """
         log.info("Telegram bot starting polling...")
 
-        # Step 1: Tunggu sampai instance lama benar-benar mati.
-        # Menggunakan Redis lock agar tidak ada 2 instance polling bersamaan.
-        await self._wait_for_deploy_lock()
+        max_retries = 10
+        base_delay = 5  # detik
 
-        # Step 2: Hapus webhook — wajib sebelum polling
-        await self._clear_webhook_with_retry()
-
-        # Step 3: Jeda singkat agar Telegram server menutup koneksi lama
-        log.info("Telegram: waiting 5s for Telegram server to release old connection...")
-        await asyncio.sleep(5)
-
-        app = self._get_app()
-        self._stop_event = asyncio.Event()
-
-        async with app:
-            await app.start()
-            await app.updater.start_polling(
-                allowed_updates=["message", "callback_query"],
-                drop_pending_updates=True,
-            )
-            log.info("Telegram bot polling active")
-
+        for attempt in range(1, max_retries + 1):
             try:
-                await self._stop_event.wait()
-            except asyncio.CancelledError:
-                log.info("Telegram polling task cancelled — stopping...")
-            finally:
-                await app.updater.stop()
-                await app.stop()
-                log.info("Telegram bot stopped cleanly")
+                # Hapus webhook dan displace polling lama
+                await self._clear_webhook_with_retry()
+                await asyncio.sleep(2)
 
-    async def _wait_for_deploy_lock(self, timeout: int = 60):
-        """
-        Gunakan Redis sebagai deployment lock.
-        - Instance lama set 'tg_polling_active' dengan TTL 60 detik saat shutdown.
-        - Instance baru tunggu sampai key itu expire / hilang.
-        - Setelah itu, instance baru set key tersebut untuk dirinya sendiri.
-        Ini mencegah 2 instance polling Telegram bersamaan.
-        """
-        from utils.redis_client import redis
+                # Build fresh Application setiap retry
+                self._app = None
+                app = self._get_app()
+                self._stop_event = asyncio.Event()
+                self._conflict_detected = False
 
-        lock_key = "tg_polling_active"
-        waited = 0
-        interval = 3
+                def on_polling_error(error):
+                    """Callback dari start_polling saat ada error."""
+                    err_str = str(error).lower()
+                    if "conflict" in err_str or "terminated by other" in err_str:
+                        log.warning(
+                            "Telegram Conflict in polling — will restart"
+                        )
+                        self._conflict_detected = True
+                        # Set stop event agar polling berhenti
+                        if self._stop_event and not self._stop_event.is_set():
+                            self._stop_event.set()
 
-        while waited < timeout:
-            lock = await redis.get(lock_key)
-            if not lock:
-                break
-            log.info(
-                "Telegram: deploy lock active (old instance still running) — "
-                "waiting... (%ds/%ds)", waited, timeout
-            )
-            await asyncio.sleep(interval)
-            waited += interval
+                async with app:
+                    await app.start()
+                    await app.updater.start_polling(
+                        allowed_updates=["message", "callback_query"],
+                        drop_pending_updates=True,
+                        error_callback=on_polling_error,
+                    )
+                    log.info(
+                        "Telegram bot polling active (attempt %d/%d)",
+                        attempt, max_retries
+                    )
 
-        if waited >= timeout:
-            log.warning(
-                "Telegram: deploy lock timeout after %ds — "
-                "forcing start (old instance may have crashed)", timeout
-            )
+                    try:
+                        await self._stop_event.wait()
+                    except asyncio.CancelledError:
+                        log.info("Telegram polling task cancelled — stopping...")
+                    finally:
+                        await app.updater.stop()
+                        await app.stop()
 
-        # Klaim lock untuk instance ini — TTL 120 detik sebagai safety net.
-        # Di-refresh saat polling aktif atau dihapus saat shutdown.
-        await redis.setex(lock_key, 120, "1")
-        log.info("Telegram: deploy lock acquired — this instance owns polling")
+                # Cek apakah berhenti karena Conflict atau graceful shutdown
+                if self._conflict_detected:
+                    delay = min(base_delay * attempt, 30)
+                    log.warning(
+                        "Telegram: restarting after Conflict "
+                        "(attempt %d/%d, waiting %ds)...",
+                        attempt, max_retries, delay
+                    )
+                    self._app = None
+                    await asyncio.sleep(delay)
+                    continue  # Retry
+                else:
+                    # Graceful shutdown — keluar dari loop
+                    log.info("Telegram bot stopped cleanly")
+                    return
+
+            except Exception as e:
+                delay = min(base_delay * attempt, 30)
+                log.error(
+                    "Telegram polling error (attempt %d/%d): %s — "
+                    "retrying in %ds",
+                    attempt, max_retries, e, delay
+                )
+                self._app = None
+                await asyncio.sleep(delay)
+
+        log.critical(
+            "Telegram: failed to start polling after %d attempts. "
+            "Bot will run WITHOUT Telegram notifications.",
+            max_retries
+        )
 
     async def _clear_webhook_with_retry(self, max_attempts: int = 5):
         """
@@ -180,14 +203,6 @@ class TelegramBot:
 
     async def stop(self):
         """Hentikan polling dari luar (dipanggil saat graceful shutdown)."""
-        # Release deploy lock agar instance baru bisa langsung mulai polling
-        try:
-            from utils.redis_client import redis
-            await redis.delete("tg_polling_active")
-            log.info("Telegram: deploy lock released")
-        except Exception as e:
-            log.warning("Telegram: failed to release deploy lock: %s", e)
-
         if self._stop_event:
             self._stop_event.set()
 
