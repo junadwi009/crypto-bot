@@ -113,7 +113,10 @@ async def graceful_shutdown(tasks: list):
     _stopping = True
 
     log.info("Graceful shutdown initiated")
-    await redis.set("bot_stopping", "1")
+    # Gunakan TTL 60 detik — flag ini hanya untuk instance INI.
+    # Kalau instance baru sudah start, flag ini akan expire sendiri
+    # sehingga tidak "meracuni" instance baru.
+    await redis.setex("bot_stopping", 60, "1")
 
     try:
         await telegram.send(
@@ -125,10 +128,8 @@ async def graceful_shutdown(tasks: list):
         pass
 
     # Stop telegram polling dulu sebelum cancel tasks lain.
-    # telegram.stop() sekarang juga melepas deploy lock di Redis,
-    # sehingga instance baru bisa langsung mulai polling.
     await telegram.stop()
-    log.info("Telegram polling stopped and deploy lock released")
+    log.info("Telegram polling stopped")
 
     # Beri waktu 3 detik agar koneksi getUpdates benar-benar terputus
     await asyncio.sleep(3)
@@ -219,11 +220,6 @@ async def main():
     await redis.ping()
     log.info("DB and Redis: connected")
 
-    # Clear flag lama dari session sebelumnya
-    await redis.delete("bot_stopping")
-    await redis.delete("bot_paused")
-    log.info("Startup flags cleared")
-
     # 3. Koneksi Bybit (non-fatal saat lokal — Bybit bisa diblokir ISP)
     try:
         await bybit.ping()
@@ -277,7 +273,13 @@ async def main():
     server = uvicorn.Server(config)
     tasks.append(asyncio.create_task(server.serve(), name="health"))
 
-    log.info("All services running — bot is active")
+    # 9. Clear flags SETELAH semua service running.
+    # Ini harus di sini (bukan di awal startup) karena ada race condition:
+    # instance lama bisa set "bot_stopping" SETELAH instance baru clear di awal.
+    # Dengan clear di sini, kita pastikan flag dari instance lama ditimpa.
+    await redis.delete("bot_stopping")
+    await redis.delete("bot_paused")
+    log.info("Startup flags cleared — all services running, bot is active")
 
     try:
         await asyncio.gather(*tasks)
