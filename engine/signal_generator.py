@@ -5,6 +5,11 @@ Orkestrasi pipeline sinyal lengkap:
   → OrderGuard → Order execution
 
 Ini jantung dari bot — semua keputusan trading dimulai di sini.
+
+PATCHED 2026-04-16:
+- Haiku confidence threshold: 0.60 → 0.45 (P0 fix low trade frequency)
+- Sonnet threshold: 0.75 → 0.65
+- Tambah log jumlah cycle per pair untuk monitoring
 """
 
 from __future__ import annotations
@@ -29,6 +34,11 @@ def _haiku():
 def _sonnet():
     from brains.sonnet_brain import sonnet_brain
     return sonnet_brain
+
+# PATCHED: turunkan dari 0.60 → 0.45
+HAIKU_CONFIDENCE_THRESHOLD = 0.45
+# PATCHED: turunkan dari 0.75 → 0.65
+SONNET_CONFIDENCE_THRESHOLD = 0.65
 
 
 class SignalGenerator:
@@ -78,17 +88,19 @@ class SignalGenerator:
                           pair, calls_today, limits["haiku"])
                 haiku_result = rule_result
 
-            # Confidence threshold setelah Haiku
-            if haiku_result["confidence"] < 0.60:
-                log.debug("%s: confidence too low after Haiku (%.2f)",
-                          pair, haiku_result["confidence"])
+            # Confidence threshold setelah Haiku (PATCHED: 0.60 → 0.45)
+            if haiku_result["confidence"] < HAIKU_CONFIDENCE_THRESHOLD:
+                log.info(
+                    "%s: confidence too low after Haiku (%.2f < %.2f) — skip",
+                    pair, haiku_result["confidence"], HAIKU_CONFIDENCE_THRESHOLD,
+                )
                 return
 
             # ── Step 3: Sonnet confirmation (hanya untuk high-confidence) ──
             final_signal = haiku_result
             sonnet_calls = await db.get_claude_calls_today("sonnet")
 
-            if (haiku_result["confidence"] >= 0.75
+            if (haiku_result["confidence"] >= SONNET_CONFIDENCE_THRESHOLD
                     and sonnet_calls < limits["sonnet"]):
                 sonnet_result = await _sonnet().confirm(
                     pair         = pair,

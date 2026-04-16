@@ -11,12 +11,12 @@
     },
     {
       "pair": "ETH/USDT",
-      "active": false,
+      "active": true,
       "strategy": "rsi_momentum",
       "category": "Layer1",
       "max_allocation_pct": 40,
-      "min_capital_required": 300,
-      "note": "Aktif mulai tier Growth"
+      "min_capital_required": 100,
+      "note": "PATCHED 2026-04-16 — aktifkan manual, min_capital 300→100. Tambah opportunity surface sesuai rekomendasi P1"
     },
     {
       "pair": "SOL/USDT",
@@ -80,5 +80,5 @@
     "Oracle": 0.10
   },
   "max_correlation": 0.85,
-  "last_updated": "2026-03-24"
+  "last_updated": "2026-04-16"
 }

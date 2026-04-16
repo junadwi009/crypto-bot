@@ -3,6 +3,11 @@ engine/rule_based.py
 Lapisan pertama analisis — rule-based tanpa Claude.
 Cepat, deterministik, gratis. Berjalan setiap tick.
 Kalau sinyal cukup kuat → lolos ke Haiku untuk validasi.
+
+PATCHED 2026-04-16:
+- Guard volume: 1.0 → 0.7 (lebih permissive untuk paper mode)
+- Signal threshold: buy/sell_score 0.40 → 0.30 (lebih banyak sinyal lewat)
+- Tambah logging detail per cycle untuk diagnosa
 """
 
 from __future__ import annotations
@@ -25,15 +30,33 @@ class RuleBasedEngine:
         params = await db.get_strategy_params(symbol)
         ind    = await market_data.get_indicators(symbol, interval="15")
 
+        # Log setiap cycle untuk diagnosa (P0 fix)
+        log.info(
+            "%s | rsi=%.1f atr_pct=%.2f vol_ratio=%.2f price=%.4f",
+            symbol,
+            ind.get("rsi", 0),
+            ind.get("atr_pct", 0),
+            ind.get("volume_ratio", 0),
+            ind.get("price", 0),
+        )
+
         # ── Guard: ATR terlalu rendah = market sideways ──────────────
         if ind["atr_pct"] < params.atr_no_trade_threshold:
+            log.info(
+                "%s: SKIP atr_low (%.2f%% < threshold %.2f%%)",
+                symbol, ind["atr_pct"], params.atr_no_trade_threshold,
+            )
             return self._signal("hold", 0.0, "atr_low",
                                 f"ATR {ind['atr_pct']:.2f}% < threshold {params.atr_no_trade_threshold}%")
 
-        # ── Guard: volume terlalu rendah ─────────────────────────────
-        if ind["volume_ratio"] < 1.0:
+        # ── Guard: volume terlalu rendah (dilonggarkan 1.0 → 0.7) ────
+        if ind["volume_ratio"] < 0.7:
+            log.info(
+                "%s: SKIP low_volume (ratio=%.2f < 0.70)",
+                symbol, ind["volume_ratio"],
+            )
             return self._signal("hold", 0.0, "low_volume",
-                                f"Volume ratio {ind['volume_ratio']:.2f} < 1.0")
+                                f"Volume ratio {ind['volume_ratio']:.2f} < 0.70")
 
         # ── Scoring sinyal ───────────────────────────────────────────
         buy_score  = 0.0
@@ -75,11 +98,17 @@ class RuleBasedEngine:
                 sell_score = min(sell_score + 0.10, 1.0)
             reasons.append(f"High volume {ind['volume_ratio']:.1f}x")
 
-        # ── Tentukan aksi ────────────────────────────────────────────
-        if buy_score >= 0.40:
+        # Log score sebelum keputusan
+        log.info(
+            "%s | buy_score=%.3f sell_score=%.3f | reasons=%s",
+            symbol, buy_score, sell_score, " + ".join(reasons) or "none",
+        )
+
+        # ── Tentukan aksi (threshold diturunkan 0.40 → 0.30) ─────────
+        if buy_score >= 0.30:
             return self._signal("buy",  round(buy_score, 3),
                                 "rule_based", " + ".join(reasons), ind)
-        if sell_score >= 0.40:
+        if sell_score >= 0.30:
             return self._signal("sell", round(sell_score, 3),
                                 "rule_based", " + ".join(reasons), ind)
 

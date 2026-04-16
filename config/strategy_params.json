@@ -1,32 +1,40 @@
 {
   "global": {
     "rsi_period": 14,
-    "rsi_oversold": 32,
-    "rsi_overbought": 71,
+    "rsi_oversold": 35,
+    "rsi_overbought": 68,
     "macd_fast": 12,
     "macd_slow": 26,
     "macd_signal": 9,
     "bb_period": 20,
     "bb_std": 2.0,
-    "stop_loss_pct": 2.2,
-    "take_profit_pct": 4.5,
+    "stop_loss_pct": 1.5,
+    "take_profit_pct": 2.0,
     "atr_period": 14,
-    "atr_no_trade_threshold": 0.8,
+    "atr_no_trade_threshold": 0.4,
     "position_multiplier": 1.0,
-    "volume_ratio_min": 1.2,
-    "note": "Parameter global — berlaku untuk semua pair kecuali ada override"
+    "volume_ratio_min": 0.8,
+    "note": "PATCHED 2026-04-16 — turunkan threshold agar lebih banyak trade di paper mode. atr 0.8→0.4, rsi oversold 32→35, rsi overbought 71→68, volume_ratio_min 1.2→0.8, sl 2.2→1.5, tp 4.5→2.0"
   },
   "BTC/USDT": {
-    "stop_loss_pct": 2.2,
-    "take_profit_pct": 4.5,
+    "stop_loss_pct": 1.5,
+    "take_profit_pct": 2.0,
+    "atr_no_trade_threshold": 0.3,
     "position_multiplier": 1.15,
-    "note": "BTC override — multiplier lebih tinggi karena win rate konsisten"
+    "note": "BTC override — ATR threshold lebih rendah karena BTC kadang range sempit"
+  },
+  "ETH/USDT": {
+    "stop_loss_pct": 1.8,
+    "take_profit_pct": 2.5,
+    "atr_no_trade_threshold": 0.4,
+    "position_multiplier": 1.0,
+    "note": "ETH — baru ditambahkan, conservative dulu"
   },
   "SOL/USDT": {
-    "stop_loss_pct": 3.0,
-    "take_profit_pct": 6.0,
-    "atr_no_trade_threshold": 1.2,
-    "note": "SOL lebih volatil — stop loss lebih lebar"
+    "stop_loss_pct": 2.0,
+    "take_profit_pct": 3.5,
+    "atr_no_trade_threshold": 0.6,
+    "note": "SOL lebih volatil — threshold ATR lebih tinggi sedikit"
   },
   "lrhr_weights": {
     "sharpe":   0.25,
@@ -36,6 +44,6 @@
     "onchain":  0.15,
     "note": "Bobot scoring LRHR — Opus update ini setiap minggu"
   },
-  "last_updated": "2026-03-24",
-  "updated_by": "manual"
+  "last_updated": "2026-04-16",
+  "updated_by": "patch-low-trade-frequency"
 }
