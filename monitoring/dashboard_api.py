@@ -2,17 +2,21 @@
 monitoring/dashboard_api.py
 HTTP endpoints untuk frontend dashboard.
 
-PATCHED 2026-05-02 (revisi 2):
-- AUTH SECURITY FIX:
-  * Hapus /api/auth/config (bocorin SHA-256 hash 6-digit PIN)
-  * Tambah /api/auth/login POST yang verifikasi PIN di server
-  * Token sesi HMAC-SHA256, dikirim lewat httpOnly cookie
-- /api/status PUBLIC — info minimal supaya App.jsx bisa polling header
-  sebelum user login (tidak return data sensitif)
-- BUG FIX: /api/infra/fund dan /api/portfolio/allocation pakai
-  db.get_infra_balance() (settings.INFRA_FUND_INITIAL tidak ada)
-- DEPRECATION FIX: utcfromtimestamp → datetime.fromtimestamp(ts, tz=timezone.utc)
-- NEW endpoint: /api/learning/summary
+PATCHED 2026-05-02 (revisi 3 — Vercel deployment):
+- Cookie samesite + secure dideteksi via env DEPLOY_ENV:
+  * production (Vercel + Render): samesite=none, secure=true
+    (cross-origin Vercel→Render butuh ini, browser modern wajib secure
+     untuk samesite=none)
+  * development (localhost):     samesite=lax,  secure=false
+- /api/auth/login route_path tetap, frontend kirim PIN lewat POST
+- Endpoint baru:
+  * POST /api/capital/inject — manual injection oleh user (skip Opus)
+  * GET  /api/capital/pending-injections — list rekomendasi pending
+  * POST /api/capital/approve/{injection_id}
+  * POST /api/capital/reject/{injection_id}
+  * GET  /api/auto-evolution/recent-actions — log auto-activation/deactivation
+- /api/status PUBLIC (App.jsx polling header sebelum login)
+- /api/infra/fund pakai db.get_infra_balance()
 """
 
 from __future__ import annotations
@@ -38,13 +42,26 @@ router = APIRouter(prefix="/api")
 SESSION_COOKIE = "cb_session"
 SESSION_TTL    = 4 * 60 * 60   # 4 jam
 
-# Server-side secret untuk HMAC. Diambil dari env var.
-# Kalau SESSION_SECRET tidak diset, fallback ke hash BOT_PIN_HASH+salt.
+# Detect deployment mode dari env. Production = cross-origin (Vercel→Render).
+# Set ALLOWED_ORIGINS di Render env var → otomatis production mode.
+DEPLOY_ENV = os.getenv("DEPLOY_ENV", "").lower()
+if not DEPLOY_ENV:
+    # Auto-detect: kalau ada ALLOWED_ORIGINS env, anggap production
+    DEPLOY_ENV = "production" if os.getenv("ALLOWED_ORIGINS", "").strip() else "development"
+
+IS_PRODUCTION = DEPLOY_ENV == "production"
+
+# Cookie attributes per environment
+COOKIE_SAMESITE = "none" if IS_PRODUCTION else "lax"
+COOKIE_SECURE   = IS_PRODUCTION  # samesite=none requires secure=true di browser modern
+
+log.info("Dashboard API mode: %s (cookie samesite=%s, secure=%s)",
+         DEPLOY_ENV, COOKIE_SAMESITE, COOKIE_SECURE)
+
 _SESSION_SECRET = os.getenv("SESSION_SECRET") or hashlib.sha256(
     (settings.BOT_PIN_HASH + "session_salt").encode()
 ).hexdigest()
 
-# Rate limit untuk login attempt
 LOGIN_RATE_KEY    = "login_attempts:{ip}"
 LOGIN_MAX_PER_HR  = 10
 
@@ -52,7 +69,6 @@ LOGIN_MAX_PER_HR  = 10
 # ── Auth helpers ──────────────────────────────────────────────────────────
 
 def _make_session_token() -> str:
-    """Generate session token: <random>.<expiry>.<hmac>"""
     rand = secrets.token_urlsafe(24)
     expiry = int(time.time()) + SESSION_TTL
     payload = f"{rand}.{expiry}"
@@ -82,8 +98,19 @@ def _validate_session_token(token: str) -> bool:
         return False
 
 
+def _set_session_cookie(response: Response, token: str):
+    """Set httpOnly cookie dengan attribute yang sesuai env."""
+    response.set_cookie(
+        key      = SESSION_COOKIE,
+        value    = token,
+        max_age  = SESSION_TTL,
+        httponly = True,
+        secure   = COOKIE_SECURE,
+        samesite = COOKIE_SAMESITE,
+    )
+
+
 async def require_auth(request: Request):
-    """FastAPI dependency: cek session cookie."""
     token = request.cookies.get(SESSION_COOKIE)
     if not _validate_session_token(token or ""):
         raise HTTPException(status_code=401, detail="unauthorized")
@@ -94,10 +121,13 @@ async def require_auth(request: Request):
 
 @router.post("/auth/login")
 async def auth_login(request: Request, response: Response):
-    """Verifikasi PIN server-side. Set httpOnly cookie kalau sukses."""
-    client_ip = request.client.host if request.client else "unknown"
-    rate_key  = LOGIN_RATE_KEY.format(ip=client_ip)
-    count     = await redis.incr(rate_key)
+    # Rate limit
+    client_ip = (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
+    rate_key = LOGIN_RATE_KEY.format(ip=client_ip)
+    count    = await redis.incr(rate_key)
     if count == 1:
         await redis.expire(rate_key, 3600)
     if int(count) > LOGIN_MAX_PER_HR:
@@ -124,21 +154,18 @@ async def auth_login(request: Request, response: Response):
         raise HTTPException(status_code=401, detail="invalid_pin")
 
     token = _make_session_token()
-    response.set_cookie(
-        key      = SESSION_COOKIE,
-        value    = token,
-        max_age  = SESSION_TTL,
-        httponly = True,
-        secure   = not settings.PAPER_TRADE,
-        samesite = "lax",
-    )
+    _set_session_cookie(response, token)
     await redis.delete(rate_key)
     return {"ok": True, "expires_in": SESSION_TTL}
 
 
 @router.post("/auth/logout")
 async def auth_logout(response: Response):
-    response.delete_cookie(SESSION_COOKIE)
+    response.delete_cookie(
+        SESSION_COOKIE,
+        samesite = COOKIE_SAMESITE,
+        secure   = COOKIE_SECURE,
+    )
     return {"ok": True}
 
 
@@ -149,8 +176,6 @@ async def auth_check(request: Request):
 
 
 # ── PUBLIC endpoint ───────────────────────────────────────────────────────
-# /api/status PUBLIC supaya App.jsx bisa render header bar sebelum user login.
-# Hanya return info minimal/non-sensitif.
 
 @router.get("/status")
 async def status_public():
@@ -178,7 +203,7 @@ async def status_public():
     }
 
 
-# ── Protected endpoints — semua butuh require_auth ────────────────────────
+# ── Protected endpoints ───────────────────────────────────────────────────
 
 @router.get("/portfolio/summary")
 async def portfolio_summary(_=Depends(require_auth)):
@@ -268,7 +293,7 @@ async def pair_params(pair_dash: str, _=Depends(require_auth)):
 
 @router.get("/claude/usage")
 async def claude_usage(_=Depends(require_auth)):
-    cost_month = await db.get_claude_cost_this_month()
+    cost_month   = await db.get_claude_cost_this_month()
     haiku_today  = await db.get_claude_calls_today("haiku")
     sonnet_today = await db.get_claude_calls_today("sonnet")
     opus_today   = await db.get_claude_calls_today("opus")
@@ -344,7 +369,6 @@ async def events_recent(hours: int = 48, _=Depends(require_auth)):
 
 @router.get("/infra/fund")
 async def infra_fund(_=Depends(require_auth)):
-    """Saldo dan riwayat infra fund."""
     try:
         balance = await db.get_infra_balance()
     except Exception as e:
@@ -413,16 +437,10 @@ async def ohlcv(pair_dash: str, interval: str = "15", limit: int = 80,
         raise HTTPException(status_code=502, detail=f"ohlcv_error: {e}")
 
 
-# ── Learning summary (NEW) ────────────────────────────────────────────────
+# ── Learning summary ──────────────────────────────────────────────────────
 
 @router.get("/learning/summary")
 async def learning_summary(_=Depends(require_auth)):
-    """
-    Ringkas state pembelajaran:
-      - News weights terbaru (akurasi per kategori)
-      - Param changes 4 minggu terakhir + outcome
-      - Trade source breakdown
-    """
     weights = await db.get_news_weights()
     weights_out = {
         cat: {
@@ -462,7 +480,140 @@ async def learning_summary(_=Depends(require_auth)):
         s["avg_pnl"]  = s["total_pnl"] / s["count"] if s["count"] else 0
 
     return {
-        "news_weights":    weights_out,
-        "opus_history":    memory_out,
+        "news_weights":     weights_out,
+        "opus_history":     memory_out,
         "source_breakdown": sources,
     }
+
+
+# ── Capital injection workflow (NEW) ──────────────────────────────────────
+
+@router.get("/capital/pending-injections")
+async def pending_injections(_=Depends(require_auth)):
+    """List rekomendasi capital injection yang masih pending approval."""
+    from engine.auto_evolution import auto_evolution
+    items = await auto_evolution.get_pending_injections()
+    return {"pending": items}
+
+
+@router.post("/capital/approve/{injection_id}")
+async def approve_injection(injection_id: str, _=Depends(require_auth)):
+    """Approve rekomendasi injection — update capital tracking."""
+    from engine.auto_evolution import auto_evolution
+    result = await auto_evolution.approve_injection(
+        injection_id, approved_by="dashboard"
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="injection_not_found")
+    return {"ok": True, "applied": result}
+
+
+@router.post("/capital/reject/{injection_id}")
+async def reject_injection(injection_id: str, _=Depends(require_auth)):
+    """Reject rekomendasi injection."""
+    from engine.auto_evolution import auto_evolution
+    ok = await auto_evolution.reject_injection(injection_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="injection_not_found")
+    return {"ok": True}
+
+
+@router.post("/capital/inject")
+async def manual_capital_inject(request: Request, _=Depends(require_auth)):
+    """
+    Manual capital injection oleh user (bypass Opus recommendation).
+    User input langsung dari dashboard tanpa harus tunggu rekomendasi.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_body")
+
+    try:
+        amount = float(body.get("amount") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invalid_amount")
+
+    if amount <= 0 or amount > 10000:
+        raise HTTPException(status_code=400, detail="amount_out_of_bounds")
+
+    note = str(body.get("note", ""))[:200]
+
+    try:
+        current = await db.get_current_capital()
+        new_capital = current + amount
+
+        from database.models import PortfolioSnapshot
+        snap = PortfolioSnapshot(
+            snapshot_date  = date.today(),
+            total_capital  = new_capital,
+            trading_capital= new_capital,
+            infra_fund     = await db.get_infra_balance(),
+            open_positions = len(
+                await db.get_open_trades(is_paper=settings.PAPER_TRADE)
+            ),
+            daily_pnl      = 0,
+            tier           = settings.get_tier(new_capital),
+            paper_trade    = settings.PAPER_TRADE,
+        )
+        await db.save_portfolio_snapshot(snap)
+
+        await db.log_event(
+            event_type = "capital_injection_manual",
+            severity   = "info",
+            message    = f"Manual capital injection ${amount:.2f}: {note}",
+            data = {
+                "amount":           amount,
+                "previous_capital": current,
+                "new_capital":      new_capital,
+                "note":             note,
+                "source":           "dashboard_manual",
+            },
+        )
+
+        # Notif Telegram
+        try:
+            from notifications.telegram_bot import telegram
+            await telegram.send(
+                f"MANUAL CAPITAL INJECTION\n\n"
+                f"Amount: ${amount:.2f}\n"
+                f"Previous: ${current:.2f}\n"
+                f"New total: ${new_capital:.2f}\n"
+                f"Note: {note or '(no note)'}"
+            )
+        except Exception:
+            pass
+
+        return {
+            "ok": True,
+            "previous_capital": current,
+            "new_capital":      new_capital,
+            "amount":           amount,
+        }
+    except Exception as e:
+        log.error("Manual injection failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="injection_failed")
+
+
+@router.get("/auto-evolution/recent-actions")
+async def recent_auto_evolution(days: int = 30, _=Depends(require_auth)):
+    """Log auto-activation/deactivation/injection terakhir untuk audit."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    res = (
+        db._get()
+        .table("bot_events")
+        .select("*")
+        .in_("event_type", [
+            "auto_pair_activated",
+            "auto_pair_deactivated",
+            "capital_injection_recommended",
+            "capital_injection_approved",
+            "capital_injection_rejected",
+            "capital_injection_manual",
+        ])
+        .gte("created_at", since)
+        .order("created_at", desc=True)
+        .limit(50)
+        .execute()
+    )
+    return {"days": days, "actions": res.data or []}

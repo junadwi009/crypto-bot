@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { StatusDot, Badge } from "./components/ui/index.jsx";
 import Dashboard from "./pages/Dashboard.jsx";
+import CapitalPage from "./pages/CapitalPage.jsx";
 import PinAuth   from "./auth/PinAuth.jsx";
 import { api }   from "./api.js";
 import "./styles/theme.css";
@@ -9,6 +10,7 @@ const NAV = [
   { key: "dashboard", label: "Dashboard",  icon: "◈" },
   { key: "trades",    label: "Trades",     icon: "⇄" },
   { key: "portfolio", label: "Portfolio",  icon: "◉" },
+  { key: "capital",   label: "Capital",    icon: "$" },
   { key: "opus",      label: "Opus Log",   icon: "✦" },
 ];
 
@@ -194,6 +196,7 @@ export default function App() {
     dashboard: <Dashboard />,
     trades:    <TradesPage />,
     portfolio: <PortfolioPage />,
+    capital:   <CapitalPage />,
     opus:      <OpusPage />,
   };
 

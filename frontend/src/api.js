@@ -1,12 +1,13 @@
 /**
  * frontend/src/api.js
  *
- * PATCHED 2026-05-02:
+ * PATCHED 2026-05-02 (revisi 3):
  * - Hapus authConfig() — endpoint /api/auth/config dihapus karena
  *   bocorin SHA-256 hash 6-digit PIN ke client (rainbow-table-able)
  * - Semua fetch sekarang pakai credentials:'include' agar session
  *   cookie httpOnly ikut terkirim
- * - Tambah login(pin), logout(), authCheck(), learningSummary()
+ * - VITE_API_URL mendukung deployment Vercel→Render (cross-origin)
+ * - Tambah capital injection endpoints
  */
 
 const BASE = import.meta.env.VITE_API_URL || "";
@@ -16,7 +17,6 @@ async function get(path) {
     credentials: "include",
   });
   if (res.status === 401) {
-    // Session expired → redirect to login
     window.dispatchEvent(new Event("auth:expired"));
     throw new Error("unauthorized");
   }
@@ -31,6 +31,10 @@ async function post(path, body) {
     credentials: "include",
     body:        body !== undefined ? JSON.stringify(body) : undefined,
   });
+  if (res.status === 401) {
+    window.dispatchEvent(new Event("auth:expired"));
+    throw new Error("unauthorized");
+  }
   if (res.status === 429) {
     const data = await res.json().catch(() => ({}));
     throw new Error(data.detail || "too_many_attempts");
@@ -81,6 +85,17 @@ export const api = {
   ohlcv:            (pair, interval = "15", limit = 80) =>
     get(`/api/ohlcv/${pair.replace("/", "-")}?interval=${interval}&limit=${limit}`),
 
-  // ── Learning summary (NEW) ────────────────────────────────
+  // ── Learning summary ──────────────────────────────────────
   learningSummary:  ()           => get("/api/learning/summary"),
+
+  // ── Capital injection (NEW) ───────────────────────────────
+  pendingInjections:    ()         => get("/api/capital/pending-injections"),
+  approveInjection:     (id)       => post(`/api/capital/approve/${id}`),
+  rejectInjection:      (id)       => post(`/api/capital/reject/${id}`),
+  manualInject:         (amount, note = "") =>
+    post("/api/capital/inject", { amount, note }),
+
+  // ── Auto-evolution audit log (NEW) ────────────────────────
+  autoEvolutionLog:     (days = 30) =>
+    get(`/api/auto-evolution/recent-actions?days=${days}`),
 };

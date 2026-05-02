@@ -1,25 +1,15 @@
 """
 brains/opus_brain.py
-Opus — meta brain dengan loop pembelajaran sungguhan.
+Opus — meta brain dengan loop pembelajaran sungguhan + auto-evolution.
 
-PATCHED 2026-05-02 (MAJOR):
-- Model ID Opus 4.5 (claude-opus-4-5-20251101)
-- LEARNING LOOP NYATA:
-  * Sebelum evaluasi, agregat akurasi news_weights dari prediction_correct
-    (dipanggil weights_aggregator.run() dulu)
-  * Konteks Opus berisi:
-      - Param changes minggu lalu + outcome 7 hari setelahnya
-      - News weight changes minggu lalu + outcome akurasi setelahnya
-      - Backtest result terbaru dari semua pair aktif
-      - Trade source breakdown (rule_based vs haiku vs sonnet vs news)
-  * Output Opus diparse ke `patterns_found` (sebelumnya kosong)
-  * Setiap parameter change disimpan dengan timestamp untuk
-    follow-up evaluation minggu depan
-
-Learning loop sekarang:
-  Week N → Opus mengubah X → Bot trading dengan X selama 7 hari
-        → Week N+1 → Opus dapat data "X mengubah win rate dari A ke B"
-        → Opus belajar apakah perubahan X efektif
+PATCHED 2026-05-02 (revisi 2):
+- Setelah eval selesai, panggil auto_evolution.apply_opus_recommendations()
+  untuk:
+  * Auto-activate pair yang Opus rekomendasikan + passing safety check
+  * Auto-deactivate pair underperform atau yang Opus rekomendasikan dimatikan
+  * Queue capital injection recommendation untuk approval user via Telegram
+- Hasil auto-evolution di-merge ke `auto_updated` di opus_memory
+- Capital injection field baru di prompt
 """
 
 from __future__ import annotations
@@ -41,7 +31,7 @@ _SYSTEM_PROMPT = (
 ).read_text()
 
 MODEL      = "claude-opus-4-5-20251101"
-MAX_TOKENS = 2500   # +500 untuk patterns_found
+MAX_TOKENS = 2500
 
 INPUT_COST  = 15.00 / 1_000_000
 OUTPUT_COST = 75.00 / 1_000_000
@@ -59,8 +49,7 @@ class OpusBrain:
         week_start = week_end - timedelta(days=7)
 
         try:
-            # Step 1: Agregat akurasi news_weights dari outcome tracker
-            # (loop pembelajaran nyata: outcome → weight → keputusan)
+            # Step 1: Aggregate news weights
             try:
                 from news.weights_aggregator import weights_aggregator
                 agg_summary = await weights_aggregator.run(days=14)
@@ -69,7 +58,7 @@ class OpusBrain:
             except Exception as e:
                 log.warning("Weights aggregator skipped: %s", e)
 
-            # Step 2: Build context dengan history pembelajaran
+            # Step 2: Build context
             context = await self._build_context(week_start, week_end)
 
             # Step 3: Call Opus
@@ -89,12 +78,10 @@ class OpusBrain:
             data["token_cost"] = round(cost, 4)
 
             await db.log_claude_usage(
-                model      = "opus",
-                calls      = 1,
-                input_tok  = usage.input_tokens,
-                output_tok = usage.output_tokens,
-                cost       = cost,
-                purpose    = "weekly_evaluation",
+                model="opus", calls=1,
+                input_tok=usage.input_tokens,
+                output_tok=usage.output_tokens,
+                cost=cost, purpose="weekly_evaluation",
             )
 
             # Step 4: Apply param updates (whitelist + bounds)
@@ -102,15 +89,45 @@ class OpusBrain:
                 data.get("params_to_update", {})
             )
 
-            # Step 5: Apply news weights update (Opus boleh override
-            # hasil aggregator hanya jika confidence tinggi)
+            # Step 5: Apply news weights override jika ada
             await self._apply_news_weights(
                 data.get("news_weights_update", {})
             )
 
-            # Step 6: Save Opus memory
-            summary = data.get("summary", {})
-            memory  = OpusMemory(
+            # Step 6: Auto-evolution (NEW) — apply pair activate/deactivate +
+            # queue capital injection recommendation
+            try:
+                from engine.auto_evolution import auto_evolution
+                evo_summary = await auto_evolution.apply_opus_recommendations(
+                    data, week_start
+                )
+            except Exception as e:
+                log.error("Auto-evolution failed: %s", e, exc_info=True)
+                evo_summary = {}
+
+            # Step 7: Save Opus memory dengan auto_updated yang lengkap
+            summary  = data.get("summary", {})
+            auto_upd = data.get("auto_updated") or []
+            # Append hasil auto-evolution ke auto_updated
+            for p in evo_summary.get("pair_activated", []):
+                auto_upd.append({
+                    "what":   "pair_activated",
+                    "detail": f"{p['pair']} (sharpe={p['sharpe']:.2f}, "
+                              f"win={p['win_rate'] * 100:.0f}%)",
+                })
+            for p in evo_summary.get("pair_deactivated", []):
+                auto_upd.append({
+                    "what":   "pair_deactivated",
+                    "detail": f"{p['pair']}: {p['reason']}",
+                })
+            if evo_summary.get("injection_pending"):
+                inj = evo_summary["injection_pending"]
+                auto_upd.append({
+                    "what":   "capital_injection_pending_approval",
+                    "detail": f"${inj['amount']:.2f} — awaiting user approval via Telegram",
+                })
+
+            memory = OpusMemory(
                 week_start       = week_start,
                 week_end         = week_end,
                 win_rate         = float(summary.get("win_rate", 0)),
@@ -118,33 +135,33 @@ class OpusBrain:
                 max_drawdown     = float(summary.get("max_drawdown", 0)),
                 total_trades     = int(summary.get("total_trades", 0)),
                 sharpe_ratio     = float(summary.get("sharpe_ratio", 0)),
-                # FIX: patterns_found sekarang diisi dari output Opus
-                # (sebelumnya disalah-petakan ke auto_updated)
                 patterns_found   = data.get("patterns_found", []),
                 actions_required = data.get("action_required", []),
-                params_updated   = params_updated,
+                params_updated   = {**params_updated, "_auto": auto_upd},
                 raw_analysis     = raw,
                 token_cost       = cost,
             )
             await db.save_opus_memory(memory)
 
             log.info(
-                "Opus evaluation complete: win=%.1f%% pnl=$%.2f patterns=%d "
-                "actions=%d cost=$%.4f",
+                "Opus eval complete: win=%.1f%% pnl=$%.2f patterns=%d actions=%d "
+                "auto_activated=%d auto_deactivated=%d injection=%s cost=$%.4f",
                 float(summary.get("win_rate", 0)) * 100,
                 float(summary.get("total_pnl", 0)),
                 len(data.get("patterns_found", [])),
                 len(data.get("action_required", [])),
+                len(evo_summary.get("pair_activated", [])),
+                len(evo_summary.get("pair_deactivated", [])),
+                "yes" if evo_summary.get("injection_pending") else "no",
                 cost,
             )
-            return data
+            return {**data, "auto_evolution": evo_summary}
 
         except Exception as e:
             log.error("Opus evaluation error: %s", e, exc_info=True)
             return {}
 
     async def _build_context(self, week_start: date, week_end: date) -> str:
-        """Build konteks lengkap untuk Opus — termasuk learning history."""
         summary      = await db.get_weekly_summary(days=7)
         recent_mem   = await db.get_recent_opus_memory(weeks=3)
         news_weights = await db.get_news_weights()
@@ -152,17 +169,30 @@ class OpusBrain:
         capital      = await db.get_current_capital()
         claude_cost  = await db.get_claude_cost_this_month()
 
-        # Trade breakdown by trigger source
         source_breakdown = await self._trade_source_breakdown(days=7)
-
-        # Backtest summary semua pair aktif (untuk validasi konsistensi)
-        bt_summary = await self._backtest_summary(active_pairs)
-
-        # Learning context: efek param change minggu lalu
-        # Bandingkan win_rate sebelum vs sesudah perubahan
+        bt_summary       = await self._backtest_summary(active_pairs)
         learning_context = self._learning_context_from_memory(recent_mem)
 
-        # Format previous evaluations
+        # Candidate pairs (untuk konsiderasi activation)
+        from engine.portfolio_manager import portfolio_manager
+        candidates = await portfolio_manager.get_candidate_pairs(capital)
+        candidates_summary = ""
+        if candidates:
+            lines = []
+            for cp in candidates[:5]:
+                bt = await db.get_best_backtest(cp)
+                if bt:
+                    lines.append(
+                        f"  {cp}: sharpe={float(bt['sharpe_ratio']):.2f} "
+                        f"win={float(bt['win_rate']) * 100:.0f}% "
+                        f"trades={int(bt.get('total_trades') or 0)}"
+                    )
+                else:
+                    lines.append(f"  {cp}: (no backtest data — skip activation)")
+            candidates_summary = "\n".join(lines)
+        else:
+            candidates_summary = "  (no candidate pairs available)"
+
         prev_context = ""
         if recent_mem:
             prev_context = "\nPREVIOUS EVALUATIONS (last 3 weeks):\n"
@@ -173,6 +203,19 @@ class OpusBrain:
                     f"pnl=${float(m.get('total_pnl', 0)):.2f} "
                     f"trades={int(m.get('total_trades', 0))}\n"
                 )
+
+        # Cek pending injections terakhir 30 hari (untuk hindari double-recommend)
+        try:
+            from engine.auto_evolution import auto_evolution
+            pending = await auto_evolution.get_pending_injections()
+            pending_str = (
+                f"\nNOTE: There is already a pending injection of "
+                f"${pending[0]['amount']:.2f} awaiting user approval. "
+                f"Do NOT recommend another injection this week."
+                if pending else ""
+            )
+        except Exception:
+            pending_str = ""
 
         return (
             f"Evaluation period: {week_start} to {week_end}\n\n"
@@ -202,19 +245,22 @@ class OpusBrain:
                 f"samples={w.sample_size}"
                 for cat, w in news_weights.items()
             )
-            + f"\n\nBACKTEST SUMMARY (most recent per pair):\n{bt_summary}"
+            + f"\n\nBACKTEST SUMMARY (active pairs):\n{bt_summary}"
+            + f"\n\nCANDIDATE PAIRS (eligible by capital, not yet activated):\n{candidates_summary}"
             + prev_context
             + f"\n\nLEARNING SIGNALS (impact of recent changes):\n{learning_context}"
+            + pending_str
             + f"\n\nPaper trade mode: {settings.PAPER_TRADE}\n"
             + "\nINSTRUCTIONS:\n"
             + "- Identify 1–4 patterns_found that are concrete and falsifiable.\n"
             + "- Reference learning signals: did last week's param changes help?\n"
             + "- Be specific in params_to_update: only change 1–3 params per week.\n"
+            + "- Pair recommendations: include lrhr_score for each.\n"
+            + "- Capital injection: only if data clearly shows modal is the bottleneck.\n"
         )
 
     @staticmethod
     def _learning_context_from_memory(recent_mem: list) -> str:
-        """Format learning loop: compare win rate before vs after param change."""
         if len(recent_mem) < 2:
             return "  (insufficient history — need at least 2 prior weeks)"
 
@@ -227,13 +273,16 @@ class OpusBrain:
         prev_pnl   = float(prev.get("total_pnl", 0))
 
         params_changed = prev.get("params_updated") or {}
-        if not params_changed:
+        # Filter out _auto meta key untuk learning context
+        params_real = {k: v for k, v in params_changed.items() if k != "_auto"}
+
+        if not params_real:
             return f"  Last week no param changes. WR: {prev_wr:.1f}% → {latest_wr:.1f}%"
 
         lines = [
             f"  Week {prev.get('week_start')} changed params:"
         ]
-        for scope, p in params_changed.items():
+        for scope, p in params_real.items():
             if isinstance(p, dict):
                 kv = ", ".join(f"{k}={v}" for k, v in p.items())
                 lines.append(f"    {scope}: {kv}")
@@ -252,7 +301,6 @@ class OpusBrain:
 
     @staticmethod
     async def _trade_source_breakdown(days: int = 7) -> dict:
-        """Group trades by trigger_source untuk lihat which AI layer paling akurat."""
         trades = await db.get_trades_for_period(days=days)
         breakdown: dict[str, dict] = {}
         for t in trades:
@@ -265,7 +313,6 @@ class OpusBrain:
             if pnl > 0:
                 breakdown[src]["wins"] += 1
 
-        # Hitung win_rate dan avg_pnl
         for src in list(breakdown.keys()):
             d = breakdown[src]
             d["win_rate"] = d["wins"] / d["count"] if d["count"] else 0.0
@@ -274,7 +321,6 @@ class OpusBrain:
 
     @staticmethod
     async def _backtest_summary(pairs: list[str]) -> str:
-        """Format backtest summary untuk semua pair aktif."""
         if not pairs:
             return "  (no active pairs)"
         lines = []
@@ -295,12 +341,6 @@ class OpusBrain:
         return "\n".join(lines)
 
     async def _apply_param_updates(self, updates: dict) -> dict:
-        """
-        Apply parameter changes — dengan whitelist dan bounds.
-        Sebelumnya: terima semua >0 → bisa set rsi_period=99999.
-        Sekarang: validasi range tiap field.
-        """
-        # Whitelist + bounds (low, high)
         ALLOWED_BOUNDS = {
             "rsi_period":              (5,   30),
             "rsi_oversold":            (15,  45),
@@ -334,7 +374,6 @@ class OpusBrain:
                         k, val, lo, hi,
                     )
                     continue
-                # int fields
                 if k in ("rsi_period", "macd_fast", "macd_slow", "macd_signal"):
                     val = int(round(val))
                 safe[k] = val
@@ -351,7 +390,6 @@ class OpusBrain:
     async def _apply_news_weights(self, weights: dict):
         if not weights:
             return
-        # Bound check: weight harus 0.0–1.0
         safe_weights: dict[str, dict] = {}
         for cat, data in weights.items():
             if not isinstance(data, dict):

@@ -1,18 +1,13 @@
 """
 crypto-bot — main.py
-Entry point. Menjalankan semua service secara paralel:
-  - Telegram bot (notifikasi + auth + error alerts)
-  - Trading loop (signal → order)
-  - News pipeline (RSS + CryptoPanic)
-  - Credit monitor
-  - Scheduler (daily/weekly tasks)
-  - Health check HTTP server (FastAPI + Render logs)
+Entry point. Menjalankan semua service secara paralel.
 
-PATCHED 2026-05-02:
-- Health endpoint baca _stopping in-memory (bukan Redis flag stale)
-- Circuit breaker dipanggil di awal trading loop dengan
-  capital_start_of_day yang benar (snapshot 00:05 hari ini)
-- Set last_scheduler_tick di Redis tiap menit untuk health check
+PATCHED 2026-05-02 (revisi 2 — Render+Vercel deployment):
+- CORS origins env-based: ALLOWED_ORIGINS env var bisa berisi
+  comma-separated list. Hindari regex `.*\\.vercel\\.app` yang
+  terlalu loose (preview deployment orang lain bisa akses).
+- Health endpoint baca _stopping in-memory
+- Trust proxy headers (Render dan Vercel pakai reverse proxy)
 """
 
 import asyncio
@@ -47,22 +42,11 @@ _stopping = False
 
 
 def is_stopping() -> bool:
-    """Untuk dipakai modul lain (dashboard_api, order_guard) tanpa
-    mengandalkan Redis."""
     return _stopping
 
 
 async def trading_loop():
-    """
-    Loop utama trading.
-    Setiap siklus:
-      1. Cek pause / circuit breaker
-      2. Cek drawdown harian (trip CB jika perlu)
-      3. Generate sinyal untuk setiap pair aktif
-      4. Monitor posisi terbuka (SL/TP)
-    """
     log.info("Trading loop started | paper_trade=%s", settings.PAPER_TRADE)
-
     while not _stopping:
         try:
             if await redis.get("bot_paused"):
@@ -74,12 +58,8 @@ async def trading_loop():
                 await asyncio.sleep(30)
                 continue
 
-            # Cek drawdown harian (sebelumnya tidak pernah dipanggil dari trading
-            # loop — circuit breaker tidak pernah trip otomatis)
             try:
                 history = await db.get_portfolio_history(days=2)
-                # snapshot harian disimpan jam 00:05; ambil yang paling baru
-                # sebagai start-of-day reference
                 if history:
                     capital_start = float(history[0].get("total_capital", 0))
                     capital_now   = await db.get_current_capital()
@@ -144,7 +124,6 @@ async def graceful_shutdown(tasks: list):
 
     await telegram.stop()
     log.info("Telegram polling stopped")
-
     await asyncio.sleep(3)
 
     for task in tasks:
@@ -166,20 +145,37 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
 app.include_router(dashboard_router)
 
-_frontend_url = os.getenv("FRONTEND_URL", "")
-ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-    "http://localhost:4173",
-    f"https://{_frontend_url}" if _frontend_url else "",
-]
+
+# ── CORS configuration ─────────────────────────────────────────────────────
+# Untuk deployment Vercel + Render:
+#   ALLOWED_ORIGINS env var berisi comma-separated list seperti:
+#     https://my-dashboard.vercel.app,https://my-dashboard-arjuna.vercel.app
+#   Plus localhost untuk dev otomatis selalu di-allow.
+
+def _build_cors_origins() -> list[str]:
+    origins = [
+        "http://localhost:5173",
+        "http://localhost:4173",
+        "http://localhost:3000",
+    ]
+    env_origins = os.getenv("ALLOWED_ORIGINS", "").strip()
+    if env_origins:
+        for o in env_origins.split(","):
+            o = o.strip()
+            if o and o not in origins:
+                origins.append(o)
+    return origins
+
+
+_origins = _build_cors_origins()
+log.info("CORS allowed origins: %s", _origins)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins      = [o for o in ALLOWED_ORIGINS if o],
-    allow_origin_regex = r"https://.*\.vercel\.app",
-    allow_credentials  = True,
-    # FIX: izinkan POST untuk endpoint /api/auth/login
-    allow_methods      = ["GET", "POST"],
-    allow_headers      = ["*"],
+    allow_origins     = _origins,
+    allow_credentials = True,
+    allow_methods     = ["GET", "POST", "OPTIONS"],
+    allow_headers     = ["Content-Type", "Authorization"],
 )
 
 
@@ -199,16 +195,6 @@ async def health():
         "status":      "stopping" if _stopping else "paused" if paused else "ok",
         "paper_trade": settings.PAPER_TRADE,
         "tier":        await db.get_current_tier(),
-    }
-
-
-@app.get("/status")
-async def status():
-    capital = await db.get_current_capital()
-    return {
-        "capital_usd":  capital,
-        "paper_trade":  settings.PAPER_TRADE,
-        "active_pairs": await db.get_active_pairs(),
     }
 
 
@@ -234,7 +220,7 @@ async def main():
         log.info("Bybit: connected")
     except Exception as e:
         if settings.PAPER_TRADE:
-            log.warning("Bybit ping failed (paper trade mode — continuing anyway): %s", e)
+            log.warning("Bybit ping failed (paper trade — continuing): %s", e)
         else:
             log.critical("Bybit ping failed in LIVE mode — stopping bot")
             raise
@@ -272,14 +258,21 @@ async def main():
         _signal.signal(_signal.SIGINT,  lambda s, f: asyncio.create_task(graceful_shutdown(tasks)))
         _signal.signal(_signal.SIGTERM, lambda s, f: asyncio.create_task(graceful_shutdown(tasks)))
 
-    config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="warning")
+    # Render menyediakan PORT env var
+    port = int(os.getenv("PORT", "8000"))
+    config = uvicorn.Config(
+        app,
+        host       = "0.0.0.0",
+        port       = port,
+        log_level  = "warning",
+        forwarded_allow_ips = "*",  # Trust Render proxy headers
+    )
     server = uvicorn.Server(config)
     tasks.append(asyncio.create_task(server.serve(), name="health"))
 
-    # Bersihkan flag stale dari instance lama
     await redis.delete("bot_stopping")
     await redis.delete("bot_paused")
-    log.info("Startup flags cleared — all services running, bot is active")
+    log.info("Startup flags cleared — all services running, bot is active on port %d", port)
 
     try:
         await asyncio.gather(*tasks)

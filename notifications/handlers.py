@@ -406,6 +406,36 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     msg += f"  • {a.get('title', '')}\n"
             await query.edit_message_text(msg)
 
+    # ── Capital injection approve/reject ──────────────────────────────
+    elif data.startswith("injection_approve_"):
+        injection_id = data.replace("injection_approve_", "")
+        from engine.auto_evolution import auto_evolution
+        result = await auto_evolution.approve_injection(
+            injection_id, approved_by=f"telegram:{chat_id}"
+        )
+        if result:
+            await query.edit_message_text(
+                f"INJECTION APPROVED\n\n"
+                f"Amount: ${result['amount']:.2f}\n"
+                f"Capital tracking telah di-update.\n\n"
+                f"Pastikan Anda transfer dana ke akun Bybit secara manual."
+            )
+        else:
+            await query.edit_message_text(
+                "Injection tidak ditemukan atau sudah expired."
+            )
+
+    elif data.startswith("injection_reject_"):
+        injection_id = data.replace("injection_reject_", "")
+        from engine.auto_evolution import auto_evolution
+        ok = await auto_evolution.reject_injection(injection_id)
+        if ok:
+            await query.edit_message_text("Injection rejected. OK.")
+        else:
+            await query.edit_message_text(
+                "Injection tidak ditemukan atau sudah expired."
+            )
+
 
 async def _execute_confirmed_action(query, action: str):
     """Eksekusi aksi setelah konfirmasi."""
