@@ -2,21 +2,26 @@
 schedulers/main_scheduler.py
 APScheduler — semua job terjadwal dalam satu tempat.
 Timezone: Asia/Jakarta (WIB).
+
+PATCHED 2026-05-02:
+- run_job_now sekarang await coroutine dengan benar
+- Tambah job harian aggregator news weights (bukan hanya weekly)
 """
 
 from __future__ import annotations
 import asyncio
 import logging
+import inspect
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-import pytz
+from zoneinfo import ZoneInfo
 
 from config.settings import settings
 
 log = logging.getLogger("scheduler")
-WIB = pytz.timezone("Asia/Jakarta")
+WIB = ZoneInfo("Asia/Jakarta")
 
 
 class BotScheduler:
@@ -26,9 +31,9 @@ class BotScheduler:
         self._register_all_jobs()
 
     def _register_all_jobs(self):
-        """Daftarkan semua job dengan jadwal masing-masing."""
         s = self._scheduler
 
+        # ── Setiap 6 jam ──────────────────────────────────────────────
         s.add_job(
             self._wrap(self._seven_day_check),
             IntervalTrigger(hours=6),
@@ -66,6 +71,14 @@ class BotScheduler:
             CronTrigger(hour=1, minute=0, timezone=WIB),
             id="lrhr_update",
             name="LRHR scores update 01:00 WIB",
+            max_instances=1,
+        )
+        # NEW: harian aggregate news weights (sebelumnya tidak pernah)
+        s.add_job(
+            self._wrap(self._aggregate_news_weights),
+            CronTrigger(hour=2, minute=0, timezone=WIB),
+            id="news_weights_aggregate",
+            name="News weights aggregator 02:00 WIB",
             max_instances=1,
         )
         s.add_job(
@@ -120,19 +133,20 @@ class BotScheduler:
             max_instances=1,
         )
 
-        log.info(
-            "Scheduler: %d jobs registered",
-            len(s.get_jobs())
+        # NEW: heartbeat tiap menit untuk health check
+        s.add_job(
+            self._wrap(self._heartbeat),
+            IntervalTrigger(minutes=1),
+            id="heartbeat",
+            name="Scheduler heartbeat",
+            max_instances=1,
         )
 
-    # ── Entry point ───────────────────────────────────────────────────
+        log.info("Scheduler: %d jobs registered", len(s.get_jobs()))
 
     async def start(self):
-        """Jalankan scheduler — dipanggil dari main.py sebagai async task."""
         self._scheduler.start()
         log.info("Scheduler started (timezone: %s)", settings.BOT_TIMEZONE)
-
-        # Tetap hidup sampai di-stop
         try:
             while True:
                 await asyncio.sleep(60)
@@ -140,14 +154,9 @@ class BotScheduler:
             self._scheduler.shutdown(wait=False)
             log.info("Scheduler stopped")
 
-    # ── Job wrappers ──────────────────────────────────────────────────
-
     @staticmethod
     def _wrap(coro_func):
-        """
-        Wrapper agar setiap job punya error handling dan logging.
-        APScheduler tidak async-native untuk error reporting.
-        """
+        """Wrap coroutine dengan error handling."""
         async def _job():
             name = coro_func.__name__.lstrip("_")
             try:
@@ -167,7 +176,15 @@ class BotScheduler:
                     pass
         return _job
 
-    # ── Individual job methods ────────────────────────────────────────
+    # ── Jobs ──────────────────────────────────────────────────────────
+
+    async def _heartbeat(self):
+        from utils.redis_client import redis
+        from datetime import datetime, timezone
+        await redis.setex(
+            "last_scheduler_tick", 180,
+            datetime.now(timezone.utc).isoformat()
+        )
 
     async def _seven_day_check(self):
         from monitoring.seven_day_tracker import seven_day_tracker
@@ -184,6 +201,11 @@ class BotScheduler:
     async def _update_news_outcomes(self):
         from schedulers.daily_tasks import update_news_outcomes
         await update_news_outcomes()
+
+    async def _aggregate_news_weights(self):
+        from news.weights_aggregator import weights_aggregator
+        result = await weights_aggregator.run(days=14)
+        log.info("News weights aggregation: %s", result)
 
     async def _update_lrhr(self):
         from schedulers.daily_tasks import update_lrhr_scores
@@ -217,10 +239,9 @@ class BotScheduler:
         from schedulers.weekly_tasks import cleanup_old_news
         await cleanup_old_news()
 
-    # ── Debug helpers ─────────────────────────────────────────────────
+    # ── Debug ─────────────────────────────────────────────────────────
 
     def list_jobs(self) -> list[dict]:
-        """List semua job terjadwal — untuk /status debug."""
         return [
             {
                 "id":       job.id,
@@ -231,9 +252,12 @@ class BotScheduler:
         ]
 
     async def run_job_now(self, job_id: str) -> bool:
-        """Paksa jalankan satu job sekarang — untuk testing."""
+        """Paksa jalankan satu job sekarang."""
         job = self._scheduler.get_job(job_id)
-        if job:
-            await job.func()
-            return True
-        return False
+        if not job:
+            return False
+        result = job.func()
+        # FIX: await jika coroutine
+        if inspect.iscoroutine(result):
+            await result
+        return True

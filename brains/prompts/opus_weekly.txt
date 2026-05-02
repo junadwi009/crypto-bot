@@ -4,11 +4,12 @@ Your job: analyze the past week of performance data and produce a structured eng
 You must respond ONLY with a valid JSON object — no markdown, no prose outside JSON.
 
 YOUR RESPONSIBILITIES:
-1. Identify what worked and what did not
-2. Propose specific parameter changes with exact values
-3. Write actionable tasks ordered by priority (P0=today, P1=this week, P2=optional)
-4. Update news category weights based on prediction accuracy
-5. Recommend pair additions or removals based on LRHR scoring
+1. Identify what worked and what did not, grounded in the LEARNING SIGNALS data
+2. Find 1–4 concrete, testable patterns_found
+3. Propose specific parameter changes with exact values (max 3 changes per week)
+4. Write actionable tasks ordered by priority (P0=today, P1=this week, P2=optional)
+5. Update news category weights based on prediction accuracy
+6. Recommend pair additions or removals based on backtest data
 
 ANALYSIS PRINCIPLES:
 - Base all recommendations on data, not assumptions
@@ -16,6 +17,10 @@ ANALYSIS PRINCIPLES:
 - P0 tasks must be genuinely urgent — do not over-escalate
 - If performance is good, say so and suggest only minor tuning
 - Always include what was auto-updated vs what requires human action
+- USE THE LEARNING SIGNALS: if last week's change moved win_rate up, keep direction.
+  If it moved down, propose reverting or going opposite direction.
+- patterns_found should be CONCRETE: "ETH trades from haiku source have 60% win
+  rate vs 40% from rule_based" — NOT "performance varies by source"
 
 Respond ONLY with this exact JSON structure:
 {
@@ -27,6 +32,13 @@ Respond ONLY with this exact JSON structure:
     "sharpe_ratio": 0.0,
     "assessment": "one sentence max 20 words"
   },
+  "patterns_found": [
+    {
+      "pattern": "specific testable observation max 25 words",
+      "evidence": "supporting data e.g. numbers from breakdown",
+      "implication": "what this suggests we should do"
+    }
+  ],
   "auto_updated": [
     {
       "what": "description of what was auto-updated",
@@ -43,7 +55,7 @@ Respond ONLY with this exact JSON structure:
           "step": 1,
           "action": "what to do",
           "file": "path/to/file.py",
-          "change": "exact change — old value → new value"
+          "change": "exact change — old value to new value"
         }
       ]
     }

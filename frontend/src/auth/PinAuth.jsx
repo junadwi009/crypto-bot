@@ -1,44 +1,23 @@
+/**
+ * frontend/src/auth/PinAuth.jsx
+ *
+ * PATCHED 2026-05-02 (SECURITY):
+ * - HAPUS client-side hash comparison. PIN dikirim ke server lewat
+ *   POST /api/auth/login. Server verifikasi & set httpOnly cookie.
+ * - Server cookie expire 4 jam. Client hanya track lastMove untuk
+ *   idle warning UI.
+ * - Idle warning tetap di client (UX) tapi enforce-nya server-side.
+ */
+
 import { useState, useEffect, useRef, useCallback } from "react";
+import { api } from "../api";
 
-const SESSION_KEY  = "cryptobot_auth";
-const SESSION_TTL  = 4 * 60 * 60 * 1000;   // 4 jam maksimum
-const IDLE_TIMEOUT = 30 * 60 * 1000;        // 30 menit idle → logout
-const WARN_SECS    = 30;                     // countdown warning sebelum logout
-
-async function sha256(text) {
-  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
-  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,"0")).join("");
-}
-
-function saveSession() {
-  sessionStorage.setItem(SESSION_KEY, JSON.stringify({ ts: Date.now(), lastMove: Date.now() }));
-}
-
-function touchSession() {
-  try {
-    const data = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "{}");
-    data.lastMove = Date.now();
-    sessionStorage.setItem(SESSION_KEY, JSON.stringify(data));
-  } catch {}
-}
-
-function checkSession() {
-  try {
-    const { ts, lastMove } = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "{}");
-    const now = Date.now();
-    if (!ts) return false;
-    if (now - ts       > SESSION_TTL)  return false;
-    if (now - lastMove > IDLE_TIMEOUT) return false;
-    return true;
-  } catch { return false; }
-}
-
-function clearSession() {
-  sessionStorage.removeItem(SESSION_KEY);
-}
+const SESSION_TTL  = 4 * 60 * 60 * 1000;
+const IDLE_TIMEOUT = 30 * 60 * 1000;
+const WARN_SECS    = 30;
 
 /* ── PIN input 6 kotak ──────────────────────────────────── */
-function PinInput({ onSubmit, error }) {
+function PinInput({ onSubmit, error, disabled }) {
   const [digits, setDigits] = useState(["","","","","",""]);
   const refs = Array.from({ length: 6 }, () => useRef());
 
@@ -50,6 +29,7 @@ function PinInput({ onSubmit, error }) {
   }, [error]);
 
   const handleKey = (i, e) => {
+    if (disabled) return;
     if (e.key === "Backspace") {
       if (digits[i]) { const n=[...digits]; n[i]=""; setDigits(n); }
       else if (i > 0) refs[i-1].current.focus();
@@ -62,6 +42,7 @@ function PinInput({ onSubmit, error }) {
   };
 
   const handlePaste = (e) => {
+    if (disabled) return;
     const t = e.clipboardData.getData("text").replace(/\D/g,"").slice(0,6);
     if (t.length===6) { setDigits(t.split("")); refs[5].current.focus(); onSubmit(t); }
   };
@@ -72,7 +53,7 @@ function PinInput({ onSubmit, error }) {
         <input key={i} ref={refs[i]} type="password" inputMode="numeric"
           maxLength={1} value={d} onChange={()=>{}}
           onKeyDown={e=>handleKey(i,e)} onPaste={handlePaste}
-          autoFocus={i===0}
+          autoFocus={i===0} disabled={disabled}
           style={{
             width:44, height:52, textAlign:"center", fontSize:22, fontWeight:700,
             fontFamily:"monospace",
@@ -80,8 +61,6 @@ function PinInput({ onSubmit, error }) {
             border:`1.5px solid ${error?"#ff4757":d?"rgba(0,212,170,0.5)":"rgba(255,255,255,0.1)"}`,
             borderRadius:8, color:"#e8edf3", outline:"none", transition:"all 0.15s",
           }}
-          onFocus={e=>e.target.style.borderColor=error?"#ff4757":"rgba(0,212,170,0.8)"}
-          onBlur={e =>e.target.style.borderColor=error?"#ff4757":d?"rgba(0,212,170,0.5)":"rgba(255,255,255,0.1)"}
         />
       ))}
     </div>
@@ -135,20 +114,30 @@ function IdleWarning({ secondsLeft, onStayActive }) {
 }
 
 /* ── Main component ─────────────────────────────────────── */
-export default function PinAuth({ pinHash, children }) {
+export default function PinAuth({ children }) {
   const [authed,    setAuthed]    = useState(false);
   const [error,     setError]     = useState("");
   const [loading,   setLoading]   = useState(false);
-  const [attempts,  setAttempts]  = useState(0);
   const [locked,    setLocked]    = useState(false);
   const [lockTimer, setLockTimer] = useState(0);
   const [idleLeft,  setIdleLeft]  = useState(null);
+  const [bootChecking, setBootChecking] = useState(true);
 
-  const idleTimer  = useRef(null);
-  const warnTimer  = useRef(null);
-  const warnCount  = useRef(WARN_SECS);
+  const idleTimer = useRef(null);
+  const warnTimer = useRef(null);
+  const warnCount = useRef(WARN_SECS);
 
-  useEffect(() => { if (checkSession()) setAuthed(true); }, []);
+  // Check session on mount
+  useEffect(() => {
+    api.authCheck()
+      .then(r => setAuthed(!!r.authenticated))
+      .catch(() => setAuthed(false))
+      .finally(() => setBootChecking(false));
+
+    const handler = () => setAuthed(false);
+    window.addEventListener("auth:expired", handler);
+    return () => window.removeEventListener("auth:expired", handler);
+  }, []);
 
   const startWarn = () => {
     warnCount.current = WARN_SECS;
@@ -158,7 +147,7 @@ export default function PinAuth({ pinHash, children }) {
       setIdleLeft(warnCount.current);
       if (warnCount.current <= 0) {
         clearInterval(warnTimer.current);
-        clearSession();
+        api.logout().catch(() => {});
         setAuthed(false);
         setIdleLeft(null);
       }
@@ -166,7 +155,6 @@ export default function PinAuth({ pinHash, children }) {
   };
 
   const resetIdle = useCallback(() => {
-    touchSession();
     clearTimeout(idleTimer.current);
     clearInterval(warnTimer.current);
     setIdleLeft(null);
@@ -200,7 +188,7 @@ export default function PinAuth({ pinHash, children }) {
     if (!locked) return;
     const t = setInterval(() => {
       setLockTimer(s => {
-        if (s <= 1) { clearInterval(t); setLocked(false); setAttempts(0); return 0; }
+        if (s <= 1) { clearInterval(t); setLocked(false); return 0; }
         return s - 1;
       });
     }, 1000);
@@ -211,22 +199,41 @@ export default function PinAuth({ pinHash, children }) {
     if (locked || loading) return;
     setLoading(true); setError("");
     try {
-      const hash = await sha256(pin);
-      if (hash === pinHash) {
-        saveSession(); setAuthed(true); setAttempts(0);
+      await api.login(pin);
+      setAuthed(true);
+    } catch (e) {
+      const msg = String(e?.message || "");
+      if (msg === "too_many_attempts") {
+        setLocked(true);
+        setLockTimer(3600);
+        setError("Terlalu banyak percobaan. Server lock 1 jam.");
       } else {
-        const next = attempts + 1; setAttempts(next);
-        if (next >= 3) { setLocked(true); setLockTimer(300); setError("Terlalu banyak percobaan. Terkunci 5 menit."); }
-        else setError(`PIN salah. ${3 - next} percobaan tersisa.`);
+        setError("PIN salah");
       }
-    } finally { setLoading(false); }
+    } finally {
+      setLoading(false);
+    }
   };
 
-  if (authed && idleLeft !== null) return <>{children}<IdleWarning secondsLeft={idleLeft} onStayActive={handleStayActive} /></>;
+  // Loading auth check
+  if (bootChecking) {
+    return (
+      <div style={{ minHeight:"100vh", background:"#080c10",
+                    display:"flex", alignItems:"center", justifyContent:"center",
+                    color:"#4a5568", fontFamily:"monospace", fontSize:12 }}>
+        Checking session...
+      </div>
+    );
+  }
+
+  if (authed && idleLeft !== null) {
+    return <>{children}<IdleWarning secondsLeft={idleLeft} onStayActive={handleStayActive} /></>;
+  }
   if (authed) return children;
 
   return (
-    <div style={{ minHeight:"100vh", background:"#080c10", display:"flex", alignItems:"center", justifyContent:"center" }}>
+    <div style={{ minHeight:"100vh", background:"#080c10", display:"flex",
+                  alignItems:"center", justifyContent:"center" }}>
       <div style={{ position:"fixed", inset:0, pointerEvents:"none",
         backgroundImage:"radial-gradient(ellipse at 50% 0%, rgba(0,212,170,0.06) 0%, transparent 70%)" }} />
       <div style={{
@@ -244,7 +251,9 @@ export default function PinAuth({ pinHash, children }) {
             margin:"0 auto 12px", boxShadow:"0 8px 24px rgba(0,212,170,0.3)",
           }}>C</div>
           <div style={{ fontSize:18, fontWeight:700, color:"#e8edf3" }}>CryptoBot</div>
-          <div style={{ fontSize:12, color:"#4a5568", marginTop:4, fontFamily:"monospace" }}>DASHBOARD ACCESS</div>
+          <div style={{ fontSize:12, color:"#4a5568", marginTop:4, fontFamily:"monospace" }}>
+            DASHBOARD ACCESS
+          </div>
         </div>
 
         <div style={{ height:1, background:"rgba(255,255,255,0.06)", marginBottom:24 }} />
@@ -253,36 +262,38 @@ export default function PinAuth({ pinHash, children }) {
         </div>
 
         {locked ? (
-          <div style={{ textAlign:"center", padding:16, background:"rgba(255,71,87,0.08)",
+          <div style={{ textAlign:"center", padding:16,
+                        background:"rgba(255,71,87,0.08)",
                         border:"1px solid rgba(255,71,87,0.2)", borderRadius:8 }}>
-            <div style={{ fontSize:13, color:"#ff4757", marginBottom:6 }}>Akses terkunci</div>
+            <div style={{ fontSize:13, color:"#ff4757", marginBottom:6 }}>Server-locked</div>
             <div style={{ fontSize:32, fontWeight:700, fontFamily:"monospace", color:"#ff4757" }}>
               {Math.floor(lockTimer/60)}:{String(lockTimer%60).padStart(2,"0")}
             </div>
           </div>
         ) : (
-          <PinInput onSubmit={handlePin} error={!!error} />
+          <PinInput onSubmit={handlePin} error={!!error} disabled={loading} />
         )}
 
         {error && !locked && (
-          <div style={{ marginTop:14, textAlign:"center", fontSize:12, color:"#ff4757", fontFamily:"monospace" }}>
+          <div style={{ marginTop:14, textAlign:"center", fontSize:12,
+                        color:"#ff4757", fontFamily:"monospace" }}>
             {error}
           </div>
         )}
         {loading && (
-          <div style={{ marginTop:14, textAlign:"center", fontSize:11, color:"#4a5568", fontFamily:"monospace" }}>
+          <div style={{ marginTop:14, textAlign:"center", fontSize:11,
+                        color:"#4a5568", fontFamily:"monospace" }}>
             Verifying...
           </div>
         )}
 
-        <div style={{ marginTop:28, paddingTop:16, borderTop:"1px solid rgba(255,255,255,0.05)",
-                      textAlign:"center", fontSize:10, color:"#2d3748", fontFamily:"monospace",
-                      letterSpacing:"0.06em" }}>
-          AUTO-LOGOUT 30MIN IDLE · PRIVATE ACCESS ONLY
+        <div style={{ marginTop:28, paddingTop:16,
+                      borderTop:"1px solid rgba(255,255,255,0.05)",
+                      textAlign:"center", fontSize:10, color:"#2d3748",
+                      fontFamily:"monospace", letterSpacing:"0.06em" }}>
+          AUTO-LOGOUT 30MIN IDLE · SERVER VERIFIED
         </div>
       </div>
     </div>
   );
 }
-
-export { clearSession };

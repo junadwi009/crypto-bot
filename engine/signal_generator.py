@@ -4,12 +4,11 @@ Orkestrasi pipeline sinyal lengkap:
   Rule-based → (jika cukup kuat) → Haiku → (jika kuat) → Sonnet
   → OrderGuard → Order execution
 
-Ini jantung dari bot — semua keputusan trading dimulai di sini.
-
-PATCHED 2026-04-16:
-- Haiku confidence threshold: 0.60 → 0.45 (P0 fix low trade frequency)
-- Sonnet threshold: 0.75 → 0.65
-- Tambah log jumlah cycle per pair untuk monitoring
+PATCHED 2026-05-02:
+- Threshold sama (0.45/0.65) — sudah di-tune untuk paper mode
+- News opportunity flag boost confidence threshold ke bawah
+  (lebih agresif kalau ada sinyal berita bullish kuat)
+- Defensive checks
 """
 
 from __future__ import annotations
@@ -26,7 +25,7 @@ from exchange.order_manager import order_manager
 
 log = logging.getLogger("signal_generator")
 
-# Lazy import untuk menghindari circular dependency
+
 def _haiku():
     from brains.haiku_brain import haiku_brain
     return haiku_brain
@@ -35,40 +34,49 @@ def _sonnet():
     from brains.sonnet_brain import sonnet_brain
     return sonnet_brain
 
-# PATCHED: turunkan dari 0.60 → 0.45
-HAIKU_CONFIDENCE_THRESHOLD = 0.45
-# PATCHED: turunkan dari 0.75 → 0.65
+
+HAIKU_CONFIDENCE_THRESHOLD  = 0.45
 SONNET_CONFIDENCE_THRESHOLD = 0.65
+
+# Boost saat news opportunity aktif
+HAIKU_THRESHOLD_OPPTY  = 0.35
+SONNET_THRESHOLD_OPPTY = 0.55
 
 
 class SignalGenerator:
 
     async def process(self, pair: str):
-        """
-        Proses satu pair melalui pipeline sinyal lengkap.
-        Dipanggil dari trading_loop di main.py setiap 30 detik.
-        """
         try:
-            # ── Step 1: Rule-based analysis (gratis, cepat) ──────────
+            # Cek news opportunity flag
+            try:
+                from engine.news_action_executor import news_action_executor
+                is_oppty = await news_action_executor.is_opportunity(pair)
+            except Exception:
+                is_oppty = False
+
+            haiku_thresh  = HAIKU_THRESHOLD_OPPTY  if is_oppty else HAIKU_CONFIDENCE_THRESHOLD
+            sonnet_thresh = SONNET_THRESHOLD_OPPTY if is_oppty else SONNET_CONFIDENCE_THRESHOLD
+
+            # Step 1: Rule-based
             rule_result = await rule_engine.analyze(pair)
 
             if rule_result["action"] == "hold":
                 log.debug("%s: rule-based → hold (%s)",
-                          pair, rule_result["reason"][:60])
+                          pair, str(rule_result.get("reason", ""))[:60])
                 return
 
             log.info("%s: rule-based → %s conf=%.2f | %s",
                      pair, rule_result["action"],
                      rule_result["confidence"],
-                     rule_result["reason"][:80])
+                     str(rule_result.get("reason", ""))[:80])
 
-            # ── Step 2: Haiku validation (cepat, murah) ──────────────
+            # Step 2: Haiku validation
             capital = await db.get_current_capital()
             limits  = settings.get_claude_limits(capital)
             calls_today = await db.get_claude_calls_today("haiku")
 
             haiku_result = None
-            if calls_today < limits["haiku"]:
+            if limits["haiku"] == -1 or calls_today < limits["haiku"]:
                 haiku_result = await _haiku().validate(
                     pair       = pair,
                     rule_signal= rule_result,
@@ -77,30 +85,29 @@ class SignalGenerator:
 
                 if haiku_result["action"] == "hold":
                     log.info("%s: haiku → hold (%s)",
-                             pair, haiku_result.get("reason", "")[:60])
+                             pair, str(haiku_result.get("reason", ""))[:60])
                     return
 
                 log.info("%s: haiku → %s conf=%.2f",
                          pair, haiku_result["action"],
                          haiku_result["confidence"])
             else:
-                log.debug("%s: Haiku rate limit reached (%d/%d) — using rule signal only",
+                log.debug("%s: Haiku rate limit reached (%d/%d) — using rule signal",
                           pair, calls_today, limits["haiku"])
                 haiku_result = rule_result
 
-            # Confidence threshold setelah Haiku (PATCHED: 0.60 → 0.45)
-            if haiku_result["confidence"] < HAIKU_CONFIDENCE_THRESHOLD:
+            if haiku_result["confidence"] < haiku_thresh:
                 log.info(
                     "%s: confidence too low after Haiku (%.2f < %.2f) — skip",
-                    pair, haiku_result["confidence"], HAIKU_CONFIDENCE_THRESHOLD,
+                    pair, haiku_result["confidence"], haiku_thresh,
                 )
                 return
 
-            # ── Step 3: Sonnet confirmation (hanya untuk high-confidence) ──
+            # Step 3: Sonnet confirmation
             final_signal = haiku_result
             sonnet_calls = await db.get_claude_calls_today("sonnet")
 
-            if (haiku_result["confidence"] >= SONNET_CONFIDENCE_THRESHOLD
+            if (haiku_result["confidence"] >= sonnet_thresh
                     and sonnet_calls < limits["sonnet"]):
                 sonnet_result = await _sonnet().confirm(
                     pair         = pair,
@@ -109,14 +116,18 @@ class SignalGenerator:
                 )
                 if sonnet_result["action"] == "hold":
                     log.info("%s: sonnet → hold (%s)",
-                             pair, sonnet_result.get("reason", "")[:60])
+                             pair, str(sonnet_result.get("reason", ""))[:60])
                     return
                 final_signal = sonnet_result
                 log.info("%s: sonnet → %s conf=%.2f",
                          pair, final_signal["action"], final_signal["confidence"])
 
-            # ── Step 4: Build TradeSignal ─────────────────────────────
+            # Step 4: Build TradeSignal
             current_price = await bybit.get_price(pair)
+            if current_price <= 0:
+                log.warning("%s: invalid current price — skip", pair)
+                return
+
             size = await position_manager.calc_position_size(
                 pair, final_signal["confidence"]
             )
@@ -132,14 +143,14 @@ class SignalGenerator:
                 action         = final_signal["action"],
                 confidence     = final_signal["confidence"],
                 source         = final_signal.get("source", "rule_based"),
-                reason         = final_signal.get("reason", ""),
+                reason         = str(final_signal.get("reason", ""))[:200],
                 price          = current_price,
                 suggested_size = size,
                 stop_loss      = sl,
                 take_profit    = tp,
             )
 
-            # ── Step 5: OrderGuard validation ────────────────────────
+            # Step 5: OrderGuard
             approved, reason = await order_guard.approve(
                 pair       = pair,
                 side       = signal.action,
@@ -151,9 +162,8 @@ class SignalGenerator:
                 log.info("%s: order rejected by guard (%s)", pair, reason)
                 return
 
-            # ── Step 6: Execute ───────────────────────────────────────
+            # Step 6: Execute
             trade_id = await order_manager.open_position(signal)
-
             if trade_id:
                 log.info("%s: trade executed → id=%s", pair, trade_id)
             else:
@@ -163,10 +173,6 @@ class SignalGenerator:
             log.error("Signal pipeline error for %s: %s", pair, e, exc_info=True)
 
     async def monitor(self):
-        """
-        Monitor posisi terbuka — cek SL/TP.
-        Dipanggil terpisah dari process() agar tidak blocking.
-        """
         await order_manager.monitor_open_trades()
 
 

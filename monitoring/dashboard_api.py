@@ -1,394 +1,468 @@
 """
 monitoring/dashboard_api.py
-FastAPI router untuk monitoring dan debug.
-Di-mount ke app utama di main.py.
-Semua endpoint read-only — tidak ada yang mengubah state bot.
+HTTP endpoints untuk frontend dashboard.
 
-UPDATED 2026-04-16:
-  - Tambah GET /api/price/{pair}     — harga realtime dari Bybit
-  - Tambah GET /api/ohlcv/{pair}     — OHLCV candle untuk chart
-  - Tambah GET /api/ticker/all       — semua pair sekaligus untuk ticker tape
-  - Tambah GET /api/portfolio/allocation — alokasi modal (trading/infra/buffer)
-  - Tambah GET /api/opus/latest-actions  — P0/P1 actions terbaru untuk banner
+PATCHED 2026-05-02 (revisi 2):
+- AUTH SECURITY FIX:
+  * Hapus /api/auth/config (bocorin SHA-256 hash 6-digit PIN)
+  * Tambah /api/auth/login POST yang verifikasi PIN di server
+  * Token sesi HMAC-SHA256, dikirim lewat httpOnly cookie
+- /api/status PUBLIC — info minimal supaya App.jsx bisa polling header
+  sebelum user login (tidak return data sensitif)
+- BUG FIX: /api/infra/fund dan /api/portfolio/allocation pakai
+  db.get_infra_balance() (settings.INFRA_FUND_INITIAL tidak ada)
+- DEPRECATION FIX: utcfromtimestamp → datetime.fromtimestamp(ts, tz=timezone.utc)
+- NEW endpoint: /api/learning/summary
 """
 
 from __future__ import annotations
+import hmac
+import hashlib
+import json
 import logging
+import secrets
+import time
+import os
+from datetime import date, datetime, timedelta, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from config.settings import settings
 from database.client import db
-from monitoring.health_check import health_checker
 from utils.redis_client import redis
 
 log = logging.getLogger("dashboard_api")
 
-router = APIRouter(prefix="/api", tags=["monitoring"])
+router = APIRouter(prefix="/api")
+
+SESSION_COOKIE = "cb_session"
+SESSION_TTL    = 4 * 60 * 60   # 4 jam
+
+# Server-side secret untuk HMAC. Diambil dari env var.
+# Kalau SESSION_SECRET tidak diset, fallback ke hash BOT_PIN_HASH+salt.
+_SESSION_SECRET = os.getenv("SESSION_SECRET") or hashlib.sha256(
+    (settings.BOT_PIN_HASH + "session_salt").encode()
+).hexdigest()
+
+# Rate limit untuk login attempt
+LOGIN_RATE_KEY    = "login_attempts:{ip}"
+LOGIN_MAX_PER_HR  = 10
 
 
-@router.get("/auth/config")
-async def auth_config():
-    """
-    Expose PIN hash ke frontend untuk verifikasi lokal.
-    SHA-256 hash tidak bisa di-reverse — aman dikirim ke browser.
-    """
-    return {"pin_hash": settings.BOT_PIN_HASH}
+# ── Auth helpers ──────────────────────────────────────────────────────────
+
+def _make_session_token() -> str:
+    """Generate session token: <random>.<expiry>.<hmac>"""
+    rand = secrets.token_urlsafe(24)
+    expiry = int(time.time()) + SESSION_TTL
+    payload = f"{rand}.{expiry}"
+    sig = hmac.new(
+        _SESSION_SECRET.encode(), payload.encode(), hashlib.sha256
+    ).hexdigest()
+    return f"{payload}.{sig}"
 
 
-# ── Health & status ───────────────────────────────────────────────────────────
+def _validate_session_token(token: str) -> bool:
+    if not token:
+        return False
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return False
+        rand, expiry_str, sig = parts
+        expiry = int(expiry_str)
+        if expiry < int(time.time()):
+            return False
+        payload = f"{rand}.{expiry_str}"
+        expected = hmac.new(
+            _SESSION_SECRET.encode(), payload.encode(), hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(sig, expected)
+    except Exception:
+        return False
 
-@router.get("/health/full")
-async def full_health():
-    """Status lengkap semua komponen."""
-    return await health_checker.full_check()
 
+async def require_auth(request: Request):
+    """FastAPI dependency: cek session cookie."""
+    token = request.cookies.get(SESSION_COOKIE)
+    if not _validate_session_token(token or ""):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return True
+
+
+# ── Auth endpoints ────────────────────────────────────────────────────────
+
+@router.post("/auth/login")
+async def auth_login(request: Request, response: Response):
+    """Verifikasi PIN server-side. Set httpOnly cookie kalau sukses."""
+    client_ip = request.client.host if request.client else "unknown"
+    rate_key  = LOGIN_RATE_KEY.format(ip=client_ip)
+    count     = await redis.incr(rate_key)
+    if count == 1:
+        await redis.expire(rate_key, 3600)
+    if int(count) > LOGIN_MAX_PER_HR:
+        raise HTTPException(status_code=429, detail="too_many_attempts")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_body")
+
+    pin = body.get("pin", "")
+    if not isinstance(pin, str) or len(pin) != 6 or not pin.isdigit():
+        raise HTTPException(status_code=400, detail="invalid_pin_format")
+
+    expected_hash = settings.BOT_PIN_HASH
+    actual_hash   = hashlib.sha256(pin.encode()).hexdigest()
+
+    if not hmac.compare_digest(expected_hash, actual_hash):
+        await db.log_event(
+            event_type="auth_failed",
+            message=f"Login failed from {client_ip}",
+            severity="warning",
+        )
+        raise HTTPException(status_code=401, detail="invalid_pin")
+
+    token = _make_session_token()
+    response.set_cookie(
+        key      = SESSION_COOKIE,
+        value    = token,
+        max_age  = SESSION_TTL,
+        httponly = True,
+        secure   = not settings.PAPER_TRADE,
+        samesite = "lax",
+    )
+    await redis.delete(rate_key)
+    return {"ok": True, "expires_in": SESSION_TTL}
+
+
+@router.post("/auth/logout")
+async def auth_logout(response: Response):
+    response.delete_cookie(SESSION_COOKIE)
+    return {"ok": True}
+
+
+@router.get("/auth/check")
+async def auth_check(request: Request):
+    token = request.cookies.get(SESSION_COOKIE)
+    return {"authenticated": _validate_session_token(token or "")}
+
+
+# ── PUBLIC endpoint ───────────────────────────────────────────────────────
+# /api/status PUBLIC supaya App.jsx bisa render header bar sebelum user login.
+# Hanya return info minimal/non-sensitif.
 
 @router.get("/status")
-async def bot_status():
-    """Ringkasan status bot untuk monitoring eksternal."""
-    capital      = await db.get_current_capital()
-    tier         = await db.get_current_tier()
-    active_pairs = await db.get_active_pairs()
-    open_trades  = await db.get_open_trades(is_paper=settings.PAPER_TRADE)
-    daily_pnl    = await db.get_total_pnl(days=1)
-    is_paused    = bool(await redis.get("bot_paused"))
-    claude_mode  = await redis.get("claude_mode") or "normal"
+async def status_public():
+    try:
+        capital = await db.get_current_capital()
+    except Exception:
+        capital = 0.0
+    try:
+        paused  = bool(await redis.get("bot_paused"))
+        cb_trip = bool(await redis.get("circuit_breaker_tripped"))
+    except Exception:
+        paused, cb_trip = False, False
+    try:
+        tier = await db.get_current_tier()
+    except Exception:
+        tier = "seed"
 
-    from main import _stopping as is_stopping
-    from engine.circuit_breaker import circuit_breaker
-    cb_status = await circuit_breaker.get_status()
-
+    bot_status = "stopped" if cb_trip else "paused" if paused else "running"
     return {
-        "status":          "stopping" if is_stopping else "paused" if is_paused else "running",
-        "paper_trade":     settings.PAPER_TRADE,
+        "status":          bot_status,
         "capital":         capital,
+        "paper_trade":     settings.PAPER_TRADE,
         "tier":            tier,
-        "daily_pnl":       daily_pnl,
-        "active_pairs":    active_pairs,
-        "open_trades":     len(open_trades),
-        "claude_mode":     claude_mode,
-        "circuit_breaker": cb_status,
+        "circuit_breaker": cb_trip,
     }
 
 
-# ── Price & market data (NEW) ─────────────────────────────────────────────────
-
-@router.get("/price/{pair}")
-async def get_price(pair: str):
-    """
-    Harga realtime satu pair dari Bybit.
-    pair: BTC-USDT atau BTCUSDT (di-normalize otomatis)
-    Dipolling frontend setiap 5 detik untuk ticker + price cards.
-    """
-    from exchange.bybit_client import bybit
-    symbol = pair.upper().replace("-", "/")
-    try:
-        ticker = await bybit.get_ticker(symbol)
-        return {
-            "symbol":     symbol,
-            "price":      ticker["last"],
-            "bid":        ticker["bid"],
-            "ask":        ticker["ask"],
-            "volume_24h": ticker["volume_24h"],
-            "change_24h": ticker["change_24h"],
-            "change_24h_pct": round(ticker["change_24h"] * 100, 3),
-        }
-    except Exception as e:
-        log.warning("Price fetch failed for %s: %s", symbol, e)
-        raise HTTPException(status_code=503, detail=f"Price unavailable: {e}")
-
-
-@router.get("/ticker/all")
-async def get_all_tickers():
-    """
-    Harga semua pair aktif + pair yang dimonitor sekaligus.
-    Dipakai ticker tape — 1 request untuk semua pair.
-    Fallback graceful jika Bybit tidak bisa dijangkau.
-    """
-    from exchange.bybit_client import bybit
-
-    # Ambil semua pair dari DB + tambah pair populer untuk ticker
-    active_pairs = await db.get_active_pairs()
-    all_pairs = list(dict.fromkeys([
-        *active_pairs,
-        "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "AVAX/USDT",
-    ]))
-
-    results = []
-    for pair in all_pairs:
-        try:
-            ticker = await bybit.get_ticker(pair)
-            results.append({
-                "symbol":         pair,
-                "price":          ticker["last"],
-                "change_24h_pct": round(ticker["change_24h"] * 100, 3),
-                "volume_24h":     ticker["volume_24h"],
-                "is_active":      pair in active_pairs,
-            })
-        except Exception as e:
-            log.debug("Ticker skip %s: %s", pair, e)
-
-    return {"count": len(results), "tickers": results}
-
-
-@router.get("/ohlcv/{pair}")
-async def get_ohlcv(pair: str, interval: str = "15", limit: int = 80):
-    """
-    OHLCV candle data dari Bybit untuk chart.
-    pair: BTC-USDT
-    interval: 1,3,5,15,30,60,120,240,D
-    limit: max 200
-    Dipakai CandlestickChart di dashboard.
-    """
-    from exchange.bybit_client import bybit
-    symbol = pair.upper().replace("-", "/")
-    if limit > 200:
-        limit = 200
-    try:
-        candles = await bybit.get_ohlcv(symbol, interval=interval, limit=limit)
-        # Tambah isUp flag dan format time untuk frontend
-        result = []
-        for c in candles:
-            ts = c["timestamp"]
-            dt = __import__("datetime").datetime.utcfromtimestamp(ts / 1000)
-            result.append({
-                "time":   dt.strftime("%H:%M"),
-                "open":   c["open"],
-                "high":   c["high"],
-                "low":    c["low"],
-                "close":  c["close"],
-                "volume": c["volume"],
-                "isUp":   c["close"] >= c["open"],
-            })
-        # Hitung BB dan RSI di backend supaya frontend ringan
-        result = _attach_indicators(result)
-        return {"symbol": symbol, "interval": interval, "count": len(result), "candles": result}
-    except Exception as e:
-        log.warning("OHLCV fetch failed for %s: %s", symbol, e)
-        raise HTTPException(status_code=503, detail=f"OHLCV unavailable: {e}")
-
-
-def _attach_indicators(candles: list[dict]) -> list[dict]:
-    """Hitung BB(20) dan RSI(14) dan attach ke candles."""
-    closes = [c["close"] for c in candles]
-    n = len(closes)
-
-    for i, c in enumerate(candles):
-        # Bollinger Bands (period=20)
-        if i >= 19:
-            sl = closes[i - 19: i + 1]
-            mean = sum(sl) / 20
-            std  = (sum((x - mean) ** 2 for x in sl) / 20) ** 0.5
-            c["bbUpper"] = round(mean + 2 * std, 2)
-            c["bbLower"] = round(mean - 2 * std, 2)
-            c["bbMid"]   = round(mean, 2)
-        else:
-            c["bbUpper"] = None
-            c["bbLower"] = None
-            c["bbMid"]   = None
-
-        # RSI (period=14)
-        if i >= 14:
-            gains, losses = 0.0, 0.0
-            for j in range(i - 13, i + 1):
-                d = closes[j] - closes[j - 1]
-                if d > 0:
-                    gains += d
-                else:
-                    losses -= d
-            rs = gains / (losses or 0.0001)
-            c["rsi"] = round(100 - 100 / (1 + rs), 1)
-        else:
-            c["rsi"] = None
-
-    return candles
-
-
-# ── Portfolio ─────────────────────────────────────────────────────────────────
-
-@router.get("/portfolio/history")
-async def portfolio_history(days: int = 30):
-    """Riwayat modal dan PnL."""
-    if days > 90:
-        days = 90
-    history = await db.get_portfolio_history(days)
-    return {"days": days, "data": history}
-
+# ── Protected endpoints — semua butuh require_auth ────────────────────────
 
 @router.get("/portfolio/summary")
-async def portfolio_summary():
-    """Ringkasan portfolio untuk Opus dan dashboard."""
-    return await db.get_weekly_summary(days=7)
+async def portfolio_summary(_=Depends(require_auth)):
+    capital   = await db.get_current_capital()
+    open_t    = await db.get_open_trades(is_paper=settings.PAPER_TRADE)
+    win_rate  = await db.get_win_rate(days=30)
+    pnl_30d   = await db.get_total_pnl(days=30)
+
+    return {
+        "capital_usd":    capital,
+        "open_positions": len(open_t),
+        "win_rate_30d":   win_rate,
+        "pnl_30d":        pnl_30d,
+        "tier":           await db.get_current_tier(),
+        "paper_trade":    settings.PAPER_TRADE,
+    }
+
+
+@router.get("/portfolio/history")
+async def portfolio_history(days: int = 30, _=Depends(require_auth)):
+    history = await db.get_portfolio_history(days=days)
+    return {"days": days, "history": history}
 
 
 @router.get("/portfolio/allocation")
-async def portfolio_allocation():
-    """
-    Alokasi modal saat ini: trading 70%, infra 15%, buffer 15%.
-    Dipakai chart alokasi modal di dashboard.
-    """
-    capital   = await db.get_current_capital()
-    infra_bal = await db.get_infra_balance()
-    trading   = round(capital * 0.70, 2)
-    infra_r   = round(capital * 0.15, 2)
-    emergency = round(capital * 0.15, 2)
+async def portfolio_allocation(_=Depends(require_auth)):
+    capital = await db.get_current_capital()
+    try:
+        infra = await db.get_infra_balance()
+    except Exception:
+        infra = 0.0
+    trading = max(0, capital - infra)
+    buffer  = capital * 0.05
     return {
-        "total":     round(capital, 2),
-        "trading":   trading,
-        "infra":     infra_r,
-        "emergency": emergency,
-        "infra_fund_balance": round(infra_bal, 2),
+        "trading": round(trading - buffer, 2),
+        "infra":   round(infra, 2),
+        "buffer":  round(buffer, 2),
+        "total":   round(capital, 2),
     }
 
 
-# ── Trades ────────────────────────────────────────────────────────────────────
-
 @router.get("/trades/open")
-async def open_trades():
-    """Semua posisi yang sedang terbuka."""
+async def trades_open(_=Depends(require_auth)):
     trades = await db.get_open_trades(is_paper=settings.PAPER_TRADE)
-    return {"count": len(trades), "trades": trades}
+    return {"trades": trades}
 
 
 @router.get("/trades/recent")
-async def recent_trades(days: int = 7):
-    """Trade yang sudah closed dalam N hari terakhir."""
-    if days > 30:
-        days = 30
-    trades = await db.get_trades_for_period(
-        days=days, is_paper=settings.PAPER_TRADE
-    )
-    closed    = [t for t in trades if t.get("status") == "closed"]
-    winners   = [t for t in closed if (t.get("pnl_usd") or 0) > 0]
-    total_pnl = sum(float(t.get("pnl_usd") or 0) for t in closed)
+async def trades_recent(days: int = 14, _=Depends(require_auth)):
+    trades = await db.get_trades_for_period(days=days)
+    return {"days": days, "trades": trades}
+
+
+@router.get("/pairs")
+async def pairs(_=Depends(require_auth)):
+    all_pairs = await db.get_all_pairs()
     return {
-        "days":      days,
-        "total":     len(closed),
-        "winners":   len(winners),
-        "win_rate":  round(len(winners) / len(closed), 4) if closed else 0,
-        "total_pnl": round(total_pnl, 4),
-        "trades":    closed,
+        "pairs": [
+            {
+                "pair":     p.pair,
+                "active":   p.active,
+                "category": p.category,
+                "min_capital": float(p.min_capital_required),
+            }
+            for p in all_pairs
+        ],
     }
 
 
-# ── Pairs & strategy ──────────────────────────────────────────────────────────
-
-@router.get("/pairs")
-async def all_pairs():
-    """Konfigurasi semua pair."""
-    pairs = await db.get_all_pairs()
-    return {"pairs": [p.model_dump(mode="json") for p in pairs]}
-
-
-@router.get("/pairs/{pair}/params")
-async def pair_params(pair: str):
-    """Parameter strategi untuk pair tertentu."""
-    pair   = pair.upper().replace("-", "/")
+@router.get("/pairs/{pair_dash}/params")
+async def pair_params(pair_dash: str, _=Depends(require_auth)):
+    pair = pair_dash.replace("-", "/")
     params = await db.get_strategy_params(pair)
-    return params.model_dump(mode="json")
+    return {
+        "pair": pair,
+        "params": {
+            "rsi_period":             params.rsi_period,
+            "rsi_oversold":           params.rsi_oversold,
+            "rsi_overbought":         params.rsi_overbought,
+            "stop_loss_pct":          float(params.stop_loss_pct),
+            "take_profit_pct":        float(params.take_profit_pct),
+            "atr_no_trade_threshold": float(params.atr_no_trade_threshold),
+            "position_multiplier":    float(params.position_multiplier),
+        },
+    }
 
-
-@router.get("/pairs/{pair}/backtest")
-async def pair_backtest(pair: str):
-    """Hasil backtest terbaik untuk pair."""
-    pair   = pair.upper().replace("-", "/")
-    result = await db.get_best_backtest(pair)
-    if not result:
-        raise HTTPException(status_code=404, detail=f"No backtest for {pair}")
-    return result
-
-
-# ── Claude & news ─────────────────────────────────────────────────────────────
 
 @router.get("/claude/usage")
-async def claude_usage():
-    """Penggunaan dan biaya Claude bulan ini + burn rate."""
-    monthly_cost = await db.get_claude_cost_this_month()
-    from brains.credit_monitor import credit_monitor
-    balance   = await credit_monitor.get_balance() or 0
-    burn_rate = await credit_monitor.get_burn_rate()
-    days_left = await credit_monitor.get_days_remaining()
-    mode      = await credit_monitor.get_claude_mode()
+async def claude_usage(_=Depends(require_auth)):
+    cost_month = await db.get_claude_cost_this_month()
+    haiku_today  = await db.get_claude_calls_today("haiku")
+    sonnet_today = await db.get_claude_calls_today("sonnet")
+    opus_today   = await db.get_claude_calls_today("opus")
+
+    capital = await db.get_current_capital()
+    limits  = settings.get_claude_limits(capital)
+
     return {
-        "monthly_cost_usd":  monthly_cost,
-        "estimated_balance": balance,
-        "burn_rate_per_day": burn_rate,
-        "days_remaining":    days_left,
-        "mode":              mode,
-        "spending_limit":    settings.ANTHROPIC_SPENDING_LIMIT,
-        "total_cost_usd":    monthly_cost,
+        "cost_this_month": cost_month,
+        "calls_today": {
+            "haiku":  haiku_today,
+            "sonnet": sonnet_today,
+            "opus":   opus_today,
+        },
+        "limits": limits,
+        "spending_limit": settings.ANTHROPIC_SPENDING_LIMIT,
     }
 
 
 @router.get("/opus/memory")
-async def opus_memory(weeks: int = 4):
-    """Riwayat evaluasi Opus."""
-    if weeks > 12:
-        weeks = 12
-    memories = await db.get_recent_opus_memory(weeks)
-    return {"weeks": weeks, "evaluations": memories}
+async def opus_memory(weeks: int = 8, _=Depends(require_auth)):
+    memory = await db.get_recent_opus_memory(weeks=weeks)
+    return {"weeks": weeks, "memory": memory}
 
 
 @router.get("/opus/latest-actions")
-async def opus_latest_actions():
-    """
-    Ambil actions P0/P1 dari evaluasi Opus terbaru.
-    Dipakai sticky banner di dashboard.
-    """
-    actions = await db.get_latest_opus_actions()
-    p0 = [a for a in actions if a.get("priority") == "P0"]
-    p1 = [a for a in actions if a.get("priority") == "P1"]
+async def opus_latest_actions(_=Depends(require_auth)):
+    memory = await db.get_recent_opus_memory(weeks=1)
+    if not memory:
+        return {"actions": [], "week_start": None}
+    latest = memory[0]
+    actions = latest.get("actions_required") or []
+    if isinstance(actions, str):
+        try:
+            actions = json.loads(actions)
+        except Exception:
+            actions = []
     return {
-        "has_critical": len(p0) > 0,
-        "p0":           p0,
-        "p1":           p1,
-        "total":        len(actions),
+        "actions":    actions[:5],
+        "week_start": latest.get("week_start"),
     }
 
 
 @router.get("/news/recent")
-async def recent_news(hours: int = 24):
-    """Berita yang diproses pipeline Claude dalam N jam terakhir."""
-    if hours > 72:
-        hours = 72
-    from datetime import datetime, timedelta, timezone
+async def news_recent(hours: int = 24, _=Depends(require_auth)):
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     res = (
         db._get()
         .table("news_items")
-        .select("headline, source, pairs_mentioned, haiku_relevance, "
-                "haiku_sentiment, sonnet_action, published_at")
+        .select("*")
         .gte("published_at", since)
         .order("published_at", desc=True)
         .limit(50)
         .execute()
     )
-    return {"hours": hours, "count": len(res.data or []), "news": res.data or []}
-
-
-# ── Infra ─────────────────────────────────────────────────────────────────────
-
-@router.get("/infra/fund")
-async def infra_fund():
-    """Saldo dan riwayat infra fund."""
-    balance = await db.get_infra_balance()
-    res = (
-        db._get()
-        .table("infra_fund")
-        .select("*")
-        .order("created_at", desc=True)
-        .limit(20)
-        .execute()
-    )
-    return {
-        "current_balance": balance,
-        "transactions":    res.data or [],
-    }
+    return {"hours": hours, "news": res.data or []}
 
 
 @router.get("/events/recent")
-async def recent_events(hours: int = 24, severity: str | None = None):
-    """Event log terbaru — trade_opened, order_error, circuit_breaker_tripped, dll."""
-    events = await db.get_recent_events(hours=hours, severity=severity)
-    return {"hours": hours, "count": len(events), "events": events}
+async def events_recent(hours: int = 48, _=Depends(require_auth)):
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    res = (
+        db._get()
+        .table("bot_events")
+        .select("*")
+        .gte("created_at", since)
+        .order("created_at", desc=True)
+        .limit(100)
+        .execute()
+    )
+    return {"hours": hours, "events": res.data or []}
+
+
+@router.get("/infra/fund")
+async def infra_fund(_=Depends(require_auth)):
+    """Saldo dan riwayat infra fund."""
+    try:
+        balance = await db.get_infra_balance()
+    except Exception as e:
+        log.warning("infra_balance lookup failed: %s", e)
+        balance = 0.0
+    try:
+        res = (
+            db._get()
+            .table("infra_fund")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(20)
+            .execute()
+        )
+        transactions = res.data or []
+    except Exception:
+        transactions = []
+    return {
+        "current_balance": round(balance, 2),
+        "transactions":    transactions,
+        "next_due":        (date.today() + timedelta(days=30)).isoformat(),
+    }
+
+
+# ── Market data ────────────────────────────────────────────────────────────
+
+@router.get("/price/{pair_dash}")
+async def get_price(pair_dash: str, _=Depends(require_auth)):
+    from exchange.bybit_client import bybit
+    pair = pair_dash.replace("-", "/")
+    try:
+        price = await bybit.get_price(pair)
+        return {"pair": pair, "price": price}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"price_unavailable: {e}")
+
+
+@router.get("/ticker/all")
+async def ticker_all(_=Depends(require_auth)):
+    from exchange.bybit_client import bybit
+    active = await db.get_active_pairs()
+    out = {}
+    for pair in active:
+        try:
+            t = await bybit.get_ticker(pair)
+            out[pair] = t
+        except Exception:
+            pass
+    return {"tickers": out}
+
+
+@router.get("/ohlcv/{pair_dash}")
+async def ohlcv(pair_dash: str, interval: str = "15", limit: int = 80,
+                 _=Depends(require_auth)):
+    from exchange.bybit_client import bybit
+    pair = pair_dash.replace("-", "/")
+    try:
+        candles = await bybit.get_ohlcv(pair, interval=interval, limit=limit)
+        for c in candles:
+            ts = c["timestamp"]
+            if ts > 1e12:
+                ts = ts // 1000
+            c["iso_utc"] = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        return {"pair": pair, "interval": interval, "candles": candles}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ohlcv_error: {e}")
+
+
+# ── Learning summary (NEW) ────────────────────────────────────────────────
+
+@router.get("/learning/summary")
+async def learning_summary(_=Depends(require_auth)):
+    """
+    Ringkas state pembelajaran:
+      - News weights terbaru (akurasi per kategori)
+      - Param changes 4 minggu terakhir + outcome
+      - Trade source breakdown
+    """
+    weights = await db.get_news_weights()
+    weights_out = {
+        cat: {
+            "weight":       float(w.weight),
+            "accuracy_1h":  float(w.accuracy_1h),
+            "accuracy_24h": float(w.accuracy_24h),
+            "sample_size":  w.sample_size,
+        }
+        for cat, w in weights.items()
+    }
+
+    memory = await db.get_recent_opus_memory(weeks=4)
+    memory_out = []
+    for m in memory:
+        memory_out.append({
+            "week_start":     str(m.get("week_start")),
+            "win_rate":       float(m.get("win_rate") or 0),
+            "total_pnl":      float(m.get("total_pnl") or 0),
+            "params_updated": m.get("params_updated") or {},
+            "patterns_count": len(m.get("patterns_found") or []),
+        })
+
+    trades = await db.get_trades_for_period(days=7)
+    sources: dict[str, dict] = {}
+    for t in trades:
+        src = t.get("trigger_source") or "unknown"
+        if src not in sources:
+            sources[src] = {"count": 0, "wins": 0, "total_pnl": 0.0}
+        sources[src]["count"] += 1
+        pnl = float(t.get("pnl_usd") or 0)
+        sources[src]["total_pnl"] += pnl
+        if pnl > 0:
+            sources[src]["wins"] += 1
+    for src in sources:
+        s = sources[src]
+        s["win_rate"] = s["wins"] / s["count"] if s["count"] else 0
+        s["avg_pnl"]  = s["total_pnl"] / s["count"] if s["count"] else 0
+
+    return {
+        "news_weights":    weights_out,
+        "opus_history":    memory_out,
+        "source_breakdown": sources,
+    }

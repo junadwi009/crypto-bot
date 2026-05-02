@@ -163,19 +163,16 @@ function OpusPage() {
 }
 
 /* ── Root ────────────────────────────────────────────────── */
+//
+// PATCHED 2026-05-02 (SECURITY):
+//   Hapus fetch /api/auth/config — endpoint itu bocorin SHA-256 hash
+//   PIN ke client. Sekarang PinAuth handle session check internally
+//   lewat /api/auth/check, dan login lewat /api/auth/login.
+//
 export default function App() {
   const [page,       setPage]      = useState("dashboard");
   const [status,     setStatus]    = useState(null);
   const [lastUpdate, setLastUpdate]= useState("—");
-  const [pinHash,    setPinHash]   = useState(null);
-
-  // Ambil pin hash dari backend
-  useEffect(() => {
-    fetch("/api/auth/config")
-      .then(r => r.json())
-      .then(d => setPinHash(d.pin_hash))
-      .catch(() => setPinHash("disabled"));
-  }, []);
 
   useEffect(() => {
     const load = () => {
@@ -200,17 +197,6 @@ export default function App() {
     opus:      <OpusPage />,
   };
 
-  // Tunggu pin hash dimuat
-  if (pinHash === null) {
-    return (
-      <div style={{ minHeight:"100vh", background:"#080c10", display:"flex",
-                    alignItems:"center", justifyContent:"center" }}>
-        <div style={{ width:8, height:8, borderRadius:"50%",
-                      background:"#00d4aa", animation:"pulse-dot 1.2s infinite" }} />
-      </div>
-    );
-  }
-
   const appContent = (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
       <Header status={status} lastUpdate={lastUpdate} />
@@ -227,8 +213,5 @@ export default function App() {
     </div>
   );
 
-  // Jika BOT_PIN_HASH tidak diset, langsung tampilkan dashboard
-  if (pinHash === "disabled" || !pinHash) return appContent;
-
-  return <PinAuth pinHash={pinHash}>{appContent}</PinAuth>;
+  return <PinAuth>{appContent}</PinAuth>;
 }

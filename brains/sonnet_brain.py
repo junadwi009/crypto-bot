@@ -2,7 +2,13 @@
 brains/sonnet_brain.py
 Sonnet — strategy brain.
 Konfirmasi trade dengan analisis multi-timeframe.
-Dipanggil ~5 kali/hari di tier Seed, hanya saat confidence Haiku ≥ 0.75.
+Dipanggil ~5 kali/hari di tier Seed, hanya saat confidence Haiku ≥ threshold.
+
+PATCHED 2026-05-02:
+- Model ID Sonnet 4.5 (claude-sonnet-4-5-20250929)
+- Robust JSON parser
+- Inject ringkasan accuracy news_weights ke konteks Sonnet
+  agar Sonnet tahu source berita mana yang historically akurat
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ _SYSTEM_PROMPT = (
     Path(__file__).parent / "prompts" / "sonnet_system.txt"
 ).read_text()
 
-MODEL      = "claude-sonnet-4-6"
+MODEL      = "claude-sonnet-4-5-20250929"
 MAX_TOKENS = 200
 
 INPUT_COST  = 3.00  / 1_000_000
@@ -36,17 +42,9 @@ class SonnetBrain:
 
     async def confirm(self, pair: str, haiku_signal: dict,
                       indicators: dict) -> dict:
-        """
-        Konfirmasi trade yang sudah lolos Haiku.
-        Pakai data multi-timeframe untuk analisis lebih dalam.
-        """
         try:
-            # Ambil multi-timeframe data
             mtf = await market_data.get_multi_timeframe(pair)
-
-            # Ambil news sentiment terbaru jika ada
             news_context = await self._get_news_context(pair)
-
             params = await db.get_strategy_params(pair)
 
             user_msg = self._build_prompt(
@@ -63,7 +61,6 @@ class SonnetBrain:
             raw  = response.content[0].text.strip()
             data = self._parse(raw)
 
-            # Track usage
             usage = response.usage
             cost  = (usage.input_tokens  * INPUT_COST +
                      usage.output_tokens * OUTPUT_COST)
@@ -85,7 +82,15 @@ class SonnetBrain:
 
         except Exception as e:
             log.error("Sonnet error for %s: %s", pair, e)
-            return haiku_signal  # Fallback ke sinyal Haiku
+            # Fallback: hold supaya trade tidak lewat tanpa konfirmasi
+            return {
+                "action":              "hold",
+                "confidence":          0.0,
+                "reason":              f"sonnet_error: {type(e).__name__}",
+                "risk_reward":         0.0,
+                "timeframe_alignment": "weak",
+                "source":              "sonnet_fallback",
+            }
 
     def _build_prompt(self, pair: str, haiku_signal: dict,
                       mtf: dict, params, news_context: str) -> str:
@@ -114,14 +119,13 @@ class SonnetBrain:
         )
 
     async def _get_news_context(self, pair: str) -> str:
-        """Ambil ringkasan berita relevan terbaru untuk context Sonnet."""
+        """Ringkasan berita relevan terbaru untuk context Sonnet."""
         try:
-            coin = pair.split("/")[0]
-            # Ambil 3 berita terbaru yang relevan dari DB
             res = (
                 db._get()
                 .table("news_items")
-                .select("headline, haiku_sentiment, haiku_urgency, published_at")
+                .select("headline, haiku_sentiment, haiku_urgency, "
+                        "sonnet_action, published_at")
                 .contains("pairs_mentioned", [pair])
                 .order("published_at", desc=True)
                 .limit(3)
@@ -134,17 +138,26 @@ class SonnetBrain:
             for item in res.data:
                 sent = float(item.get("haiku_sentiment") or 0)
                 label = "bullish" if sent > 0.3 else "bearish" if sent < -0.3 else "neutral"
-                lines.append(f"- [{label}] {item['headline'][:80]}")
+                action = item.get("sonnet_action") or "hold"
+                lines.append(
+                    f"- [{label}|{action}] {item['headline'][:80]}"
+                )
             return "\n".join(lines)
         except Exception:
             return ""
 
     def _parse(self, raw: str) -> dict:
         try:
-            clean = raw.strip().lstrip("```json").rstrip("```").strip()
-            data  = json.loads(clean)
+            clean = raw.strip()
+            if clean.startswith("```"):
+                clean = clean.split("\n", 1)[1] if "\n" in clean else clean[3:]
+            if clean.endswith("```"):
+                clean = clean.rsplit("```", 1)[0]
+            clean = clean.strip()
 
-            action     = data.get("action", "hold").lower()
+            data = json.loads(clean)
+
+            action     = str(data.get("action", "hold")).lower()
             confidence = float(data.get("confidence", 0.0))
             reason     = str(data.get("reason", ""))[:120]
             rr         = float(data.get("risk_reward", 0.0))
@@ -154,7 +167,7 @@ class SonnetBrain:
                 action = "hold"
             confidence = max(0.0, min(1.0, confidence))
 
-            # Reject jika risk/reward terlalu rendah
+            # Reject jika R/R terlalu rendah
             if rr > 0 and rr < 1.5 and action != "hold":
                 log.info("Sonnet: rejecting low R/R %.2f", rr)
                 action     = "hold"

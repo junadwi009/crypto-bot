@@ -7,6 +7,12 @@ Entry point. Menjalankan semua service secara paralel:
   - Credit monitor
   - Scheduler (daily/weekly tasks)
   - Health check HTTP server (FastAPI + Render logs)
+
+PATCHED 2026-05-02:
+- Health endpoint baca _stopping in-memory (bukan Redis flag stale)
+- Circuit breaker dipanggil di awal trading loop dengan
+  capital_start_of_day yang benar (snapshot 00:05 hari ini)
+- Set last_scheduler_tick di Redis tiap menit untuk health check
 """
 
 import asyncio
@@ -34,21 +40,26 @@ from news.fetcher import news_fetcher
 from notifications.telegram_bot import telegram
 from schedulers.main_scheduler import BotScheduler
 
-# ── Setup logging ──────────────────────────────────────────────────────────
 setup_logging()
 log = logging.getLogger("main")
 
-# ── Graceful shutdown flag ─────────────────────────────────────────────────
 _stopping = False
+
+
+def is_stopping() -> bool:
+    """Untuk dipakai modul lain (dashboard_api, order_guard) tanpa
+    mengandalkan Redis."""
+    return _stopping
 
 
 async def trading_loop():
     """
-    Loop utama trading — berjalan terus selama bot aktif.
+    Loop utama trading.
     Setiap siklus:
-      1. Cek circuit breaker
-      2. Generate sinyal untuk setiap pair aktif (rule → Haiku → Sonnet)
-      3. Monitor posisi terbuka (SL/TP)
+      1. Cek pause / circuit breaker
+      2. Cek drawdown harian (trip CB jika perlu)
+      3. Generate sinyal untuk setiap pair aktif
+      4. Monitor posisi terbuka (SL/TP)
     """
     log.info("Trading loop started | paper_trade=%s", settings.PAPER_TRADE)
 
@@ -62,6 +73,20 @@ async def trading_loop():
                 log.warning("Circuit breaker active — skipping cycle")
                 await asyncio.sleep(30)
                 continue
+
+            # Cek drawdown harian (sebelumnya tidak pernah dipanggil dari trading
+            # loop — circuit breaker tidak pernah trip otomatis)
+            try:
+                history = await db.get_portfolio_history(days=2)
+                # snapshot harian disimpan jam 00:05; ambil yang paling baru
+                # sebagai start-of-day reference
+                if history:
+                    capital_start = float(history[0].get("total_capital", 0))
+                    capital_now   = await db.get_current_capital()
+                    if capital_start > 0:
+                        await circuit_breaker.check(capital_now, capital_start)
+            except Exception as e:
+                log.debug("CB inline check skipped: %s", e)
 
             active_pairs = await db.get_active_pairs()
             for pair in active_pairs:
@@ -78,9 +103,7 @@ async def trading_loop():
 
 
 async def news_loop():
-    """Loop news pipeline — ambil berita setiap 15 menit."""
     log.info("News pipeline started")
-
     while not _stopping:
         try:
             await news_fetcher.run()
@@ -93,9 +116,7 @@ async def news_loop():
 
 
 async def credit_monitor_loop():
-    """Cek saldo token Anthropic setiap jam."""
     log.info("Credit monitor started")
-
     while not _stopping:
         try:
             await credit_monitor.check()
@@ -108,10 +129,8 @@ async def credit_monitor_loop():
 
 
 async def graceful_shutdown(tasks: list):
-    """Hentikan bot dengan aman — tunggu posisi terbuka, lalu stop semua task."""
     global _stopping
     _stopping = True
-
     log.info("Graceful shutdown initiated")
 
     try:
@@ -123,11 +142,9 @@ async def graceful_shutdown(tasks: list):
     except Exception:
         pass
 
-    # Stop telegram polling dulu sebelum cancel tasks lain.
     await telegram.stop()
     log.info("Telegram polling stopped")
 
-    # Beri waktu 3 detik agar koneksi getUpdates benar-benar terputus
     await asyncio.sleep(3)
 
     for task in tasks:
@@ -145,28 +162,26 @@ async def lifespan(app: FastAPI):
     yield
     log.info("Health check server stopped")
 
+
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
 app.include_router(dashboard_router)
 
-# CORS — izinkan frontend Vercel akses API
-# Set FRONTEND_URL di env Render dengan domain Vercel kamu
-# Contoh: nama-project.vercel.app (tanpa https://)
 _frontend_url = os.getenv("FRONTEND_URL", "")
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://localhost:4173",
     f"https://{_frontend_url}" if _frontend_url else "",
-    # Support preview deployments Vercel (*.vercel.app)
-    # dengan pattern matching — ditangani oleh allow_origin_regex di bawah
 ]
 app.add_middleware(
     CORSMiddleware,
     allow_origins      = [o for o in ALLOWED_ORIGINS if o],
     allow_origin_regex = r"https://.*\.vercel\.app",
     allow_credentials  = True,
-    allow_methods      = ["GET"],
+    # FIX: izinkan POST untuk endpoint /api/auth/login
+    allow_methods      = ["GET", "POST"],
     allow_headers      = ["*"],
 )
+
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
@@ -176,15 +191,16 @@ async def add_security_headers(request: Request, call_next):
     response.headers["X-Frame-Options"]        = "DENY"
     return response
 
+
 @app.get("/health")
 async def health():
-    """Render.com health check endpoint — dipanggil setiap 30 detik."""
-    paused   = bool(await redis.get("bot_paused"))
+    paused = bool(await redis.get("bot_paused"))
     return {
         "status":      "stopping" if _stopping else "paused" if paused else "ok",
         "paper_trade": settings.PAPER_TRADE,
         "tier":        await db.get_current_tier(),
     }
+
 
 @app.get("/status")
 async def status():
@@ -207,15 +223,12 @@ async def main():
     log.info("  Capital     : $%s", settings.INITIAL_CAPITAL)
     log.info("=" * 50)
 
-    # 1. Validasi semua env vars wajib
     validate_secrets()
 
-    # 2. Koneksi database & Redis
     await db.ping()
     await redis.ping()
     log.info("DB and Redis: connected")
 
-    # 3. Koneksi Bybit (non-fatal saat lokal — Bybit bisa diblokir ISP)
     try:
         await bybit.ping()
         log.info("Bybit: connected")
@@ -226,7 +239,6 @@ async def main():
             log.critical("Bybit ping failed in LIVE mode — stopping bot")
             raise
 
-    # 4. Notif startup ke Telegram
     mode = "PAPER TRADE" if settings.PAPER_TRADE else "LIVE TRADING"
     await telegram.send(
         f"Bot started\n"
@@ -235,20 +247,17 @@ async def main():
         f"Timezone: WIB (Asia/Jakarta)"
     )
 
-    # 5. Inisialisasi scheduler
     scheduler = BotScheduler()
 
-    # 6. Start semua async tasks secara paralel
     tasks = [
-        asyncio.create_task(trading_loop(),       name="trading"),
+        asyncio.create_task(trading_loop(),        name="trading"),
         asyncio.create_task(news_loop(),           name="news"),
         asyncio.create_task(credit_monitor_loop(), name="credit"),
         asyncio.create_task(telegram.run(),        name="telegram"),
         asyncio.create_task(scheduler.start(),     name="scheduler"),
     ]
 
-    # 7. Handle SIGTERM dari Render
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def handle_signal():
         log.info("Signal received — initiating graceful shutdown")
@@ -263,15 +272,11 @@ async def main():
         _signal.signal(_signal.SIGINT,  lambda s, f: asyncio.create_task(graceful_shutdown(tasks)))
         _signal.signal(_signal.SIGTERM, lambda s, f: asyncio.create_task(graceful_shutdown(tasks)))
 
-    # 8. Health check server (FastAPI + uvicorn)
     config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="warning")
     server = uvicorn.Server(config)
     tasks.append(asyncio.create_task(server.serve(), name="health"))
 
-    # 9. Clear flags SETELAH semua service running.
-    # Clear stale Redis flags dari instance sebelumnya.
-    # bot_stopping tidak lagi disimpan di Redis (pakai in-memory _stopping),
-    # tapi kita tetap hapus untuk membersihkan sisa dari versi kode lama.
+    # Bersihkan flag stale dari instance lama
     await redis.delete("bot_stopping")
     await redis.delete("bot_paused")
     log.info("Startup flags cleared — all services running, bot is active")
