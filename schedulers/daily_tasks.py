@@ -2,16 +2,17 @@
 schedulers/daily_tasks.py
 Job harian — semua task yang dijadwal cron harian.
 
-PATCHED 2026-05-02 (revisi 2):
+PATCHED 2026-05-02 (revisi 3):
+- BUG FIX: payment_reminder.send_if_due() → check_and_send()
+  (method name salah, hasilnya scheduler_job_error setiap hari jam 10:00)
 - Portfolio snapshot pakai db.get_infra_balance() bukan
-  settings.INFRA_FUND_INITIAL yang tidak ada → 500 error sebelumnya
+  settings.INFRA_FUND_INITIAL yang tidak ada
 - Capital_start_of_day diambil benar untuk circuit breaker reference
-- update_news_outcomes punya error per-batch (dulu satu error matiin loop)
 """
 
 from __future__ import annotations
 import logging
-from datetime import date, datetime, timezone
+from datetime import date
 
 from database.client import db
 from database.models import PortfolioSnapshot
@@ -27,13 +28,11 @@ async def take_portfolio_snapshot():
         open_trades = await db.get_open_trades(is_paper=settings.PAPER_TRADE)
         total_pnl   = await db.get_total_pnl(days=1)
 
-        # Hitung tier
         if capital < 300:    tier = "seed"
         elif capital < 700:  tier = "growth"
         elif capital < 1500: tier = "pro"
         else:                tier = "elite"
 
-        # Get infra balance from DB (single source of truth)
         try:
             infra = await db.get_infra_balance()
         except Exception as e:
@@ -58,15 +57,16 @@ async def take_portfolio_snapshot():
 
 
 async def run_payment_reminder():
+    """
+    PATCHED: method sebelumnya `send_if_due()` tidak ada — bug ini
+    yang muncul di event log sebagai 'PaymentReminder...failed'.
+    Method yang benar: check_and_send().
+    """
     from notifications.payment_reminder import payment_reminder
-    await payment_reminder.send_if_due()
+    await payment_reminder.check_and_send()
 
 
 async def update_news_outcomes():
-    """
-    Ambil semua news_items yang belum punya price_1h_after / price_24h_after,
-    cek kalau sudah lewat horizon, isi harga & prediction_correct.
-    """
     log.info("Hourly: news outcome update")
     try:
         from news.outcome_tracker import outcome_tracker
@@ -91,12 +91,9 @@ async def update_lrhr_scores():
 
 
 async def monitor_circuit_breaker():
-    """Cek drawdown intraday, trip CB kalau perlu."""
     try:
         from engine.circuit_breaker import circuit_breaker
         capital_now = await db.get_current_capital()
-
-        # Ambil snapshot 00:05 hari ini (start of day reference)
         history = await db.get_portfolio_history(days=2)
         if history:
             capital_start = float(history[0].get("total_capital") or capital_now)
@@ -106,7 +103,6 @@ async def monitor_circuit_breaker():
 
 
 async def check_supabase_activity():
-    """Keep-alive query agar Supabase free tier tidak pause."""
     try:
         await db.ping()
         log.info("Supabase keep-alive: OK")

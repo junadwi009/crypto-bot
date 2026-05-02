@@ -1,14 +1,16 @@
 """
 news/analyzer.py
 Pipeline analisis berita: Haiku filter → Sonnet deep analysis.
-Haiku memfilter relevansi, Sonnet menganalisis dampak trading.
 
-PATCHED 2026-05-02:
-- BUG FIX: variabel `item` di _save_news() → `raw_item` (NameError)
-- BUG FIX: model string Sonnet diperbarui ke ID resmi Anthropic
-- ENHANCEMENT: setelah Sonnet analysis, panggil news_action_executor
-  agar action "opportunity / close / reduce_risk" benar-benar dieksekusi
-  (sebelumnya hanya di-log tanpa side-effect → AI tidak punya outcome)
+PATCHED 2026-05-02 (revisi 3):
+- BUG FIX (CRITICAL): price_at_news sebelumnya selalu `{}` karena
+  bybit.get_price() silently fail di try/except. Sekarang:
+    1. Coba get_price() langsung
+    2. Kalau gagal, fallback ke historical kline (1m candle terdekat)
+    3. Kalau masih gagal, log WARNING (bukan diam) — operator harus tahu
+- Variabel `item` → `raw_item` (NameError fix dari sebelumnya)
+- Model string Sonnet ke ID resmi
+- News action executor terhubung
 """
 
 from __future__ import annotations
@@ -24,7 +26,6 @@ from database.models import NewsItem
 
 log = logging.getLogger("news_analyzer")
 
-# Model strings — pakai ID resmi Anthropic API
 MODEL_HAIKU  = "claude-haiku-4-5-20251001"
 MODEL_SONNET = "claude-sonnet-4-5-20250929"
 
@@ -71,6 +72,35 @@ Rules:
 """
 
 
+async def _get_price_with_fallback(pair: str) -> float | None:
+    """
+    Robust price fetch: cobalive ticker dulu, kalau gagal pakai kline 1m.
+    Return None hanya jika benar-benar gagal — tidak silent.
+    """
+    from exchange.bybit_client import bybit
+
+    # Attempt 1: live ticker
+    try:
+        price = await bybit.get_price(pair)
+        if price > 0:
+            return price
+    except Exception as e:
+        log.debug("get_price live failed for %s: %s — trying kline fallback",
+                  pair, e)
+
+    # Attempt 2: kline 1m candle terbaru
+    try:
+        candles = await bybit.get_ohlcv(pair, interval="1", limit=1)
+        if candles and len(candles) > 0:
+            last_close = float(candles[-1].get("close", 0))
+            if last_close > 0:
+                return last_close
+    except Exception as e:
+        log.warning("get_ohlcv fallback also failed for %s: %s", pair, e)
+
+    return None
+
+
 class NewsAnalyzer:
 
     def __init__(self):
@@ -115,7 +145,7 @@ class NewsAnalyzer:
         sonnet_result = await self._sonnet_analyze(headline, pairs, haiku_result)
         news_id = await self._save_news(item, haiku_result, sonnet_result)
 
-        # Step 3: Eksekusi aksi (NEW)
+        # Step 3: Eksekusi aksi
         if sonnet_result and sonnet_result.get("action") not in (None, "hold"):
             log.info(
                 "News action signal: %s | %s | conf=%.2f | %s",
@@ -163,7 +193,6 @@ class NewsAnalyzer:
             return result
         except Exception as e:
             log.debug("Haiku news filter error: %s", e)
-            # Default tidak relevan supaya tidak boros Sonnet kalau Haiku error
             return {"relevance": 0.0, "sentiment": 0.0,
                     "urgency": 0.0, "should_analyze": False}
 
@@ -203,7 +232,7 @@ class NewsAnalyzer:
 
     async def _save_news(self, raw_item: dict,
                           haiku: dict, sonnet: dict | None) -> str:
-        """Simpan berita. Return news_id."""
+        """Simpan berita dengan baseline price wajib."""
         try:
             from dateutil import parser as dtparse
             pub_str = raw_item.get("published_at", "")
@@ -212,17 +241,19 @@ class NewsAnalyzer:
             except Exception:
                 pub_dt = datetime.now(timezone.utc)
 
-            # FIX: variabel sebelumnya `item` (NameError). Sekarang `raw_item`.
+            # CAPTURE BASELINE PRICE — pakai fallback chain yang robust.
+            # Kalau benar-benar gagal, log WARNING (bukan diam).
             prices_now: dict[str, float] = {}
-            try:
-                from exchange.bybit_client import bybit
-                for pair in (raw_item.get("pairs_mentioned") or []):
-                    try:
-                        prices_now[pair] = await bybit.get_price(pair)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            for pair in (raw_item.get("pairs_mentioned") or []):
+                price = await _get_price_with_fallback(pair)
+                if price is not None:
+                    prices_now[pair] = price
+                else:
+                    log.warning(
+                        "Could not fetch baseline price for %s — "
+                        "outcome tracking will be impaired for this news",
+                        pair
+                    )
 
             item_obj = NewsItem(
                 headline           = raw_item["headline"],
