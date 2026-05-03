@@ -2,10 +2,16 @@
 schedulers/weekly_tasks.py
 Job mingguan: backtest, Opus evaluation, crash test, cleanup.
 
-PATCHED 2026-05-02:
-- Opus evaluation memanggil weights_aggregator dulu (di Opus._build_context),
-  lalu backtest_results_analyzer untuk feedback ke param
-- Cleanup news pakai delete cascade
+PATCHED 2026-05-02 (revisi 4):
+- BUG FIX: crash_injector.run(pair) → crash_injector.run_all_scenarios()
+  Method run() tidak ada di CrashInjector class. Selain itu konsep loop
+  per-pair juga salah — crash test memang per-skenario historis (covid,
+  china ban, luna, ftx), bukan per-pair Arjuna.
+- BUG FIX: backtest_runner.run(pair, days=30) → backtest_runner.run(pair, months=1)
+  Parameter `days` tidak ada, yang ada `months`.
+- BUG FIX: result adalah BacktestResult object (Pydantic), pakai
+  result.sharpe_ratio bukan result.get("sharpe_ratio")
+- Opus evaluation tetap memanggil weights_aggregator dulu (di Opus._build_context)
 """
 
 from __future__ import annotations
@@ -36,7 +42,6 @@ async def run_opus_evaluation():
             log.info("Opus evaluation: %d patterns, %d actions",
                      len(patterns), len(actions))
 
-            # Notif Telegram dengan ringkasan
             try:
                 from notifications.telegram_bot import telegram
                 summary = result.get("summary", {})
@@ -61,7 +66,10 @@ async def run_opus_evaluation():
 
 
 async def run_weekly_backtest():
-    """Backtest tiap pair aktif. Hasil disimpan ke backtest_results."""
+    """
+    Backtest tiap pair aktif, pakai data 1 bulan terakhir.
+    Hasil disimpan otomatis oleh backtest_runner.run() ke tabel backtest_results.
+    """
     log.info("Weekly: backtest semua pair aktif")
     try:
         from backtesting.runner import backtest_runner
@@ -69,11 +77,19 @@ async def run_weekly_backtest():
         active_pairs = await db.get_active_pairs()
         for pair in active_pairs:
             try:
-                result = await backtest_runner.run(pair, days=30)
-                log.info("Backtest %s: sharpe=%.2f win=%.1f%% trades=%d",
-                         pair, result.get("sharpe_ratio", 0),
-                         result.get("win_rate", 0) * 100,
-                         result.get("total_trades", 0))
+                # FIX: parameter benar adalah `months`, bukan `days`
+                result = await backtest_runner.run(pair, months=1)
+                if result:
+                    # FIX: BacktestResult adalah Pydantic model, akses via attribute
+                    log.info(
+                        "Backtest %s: sharpe=%.2f win=%.1f%% trades=%d",
+                        pair,
+                        float(result.sharpe_ratio),
+                        float(result.win_rate) * 100,
+                        int(result.total_trades),
+                    )
+                else:
+                    log.warning("Backtest %s returned no result (insufficient data)", pair)
             except Exception as e:
                 log.error("Backtest %s failed: %s", pair, e)
     except Exception as e:
@@ -81,21 +97,44 @@ async def run_weekly_backtest():
 
 
 async def run_weekly_crash_test():
-    """Inject crash scenario ke market data dan run backtest."""
+    """
+    Test bot terhadap skenario crash historis (COVID 2020, China ban 2021,
+    LUNA 2022, FTX 2022). Bukan per-pair — per-skenario.
+    """
     log.info("Weekly: crash injection test")
     try:
         from backtesting.crash_injector import crash_injector
-        active_pairs = await db.get_active_pairs()
-        for pair in active_pairs:
-            try:
-                result = await crash_injector.run(pair)
-                log.info("Crash test %s: max_dd=%.1f%% survived=%s",
-                         pair, result.get("max_drawdown", 0) * 100,
-                         result.get("survived", False))
-            except Exception as e:
-                log.error("Crash test %s failed: %s", pair, e)
+        # FIX: method yang benar adalah run_all_scenarios(), tanpa argument.
+        # CrashInjector punya CRASH_EVENTS dict sendiri, dia tidak per-pair.
+        summary = await crash_injector.run_all_scenarios()
+
+        if summary:
+            log.info(
+                "Crash tests: %d/%d scenarios passed (rate=%.0f%%)",
+                summary.get("passed", 0),
+                summary.get("total", 0),
+                summary.get("pass_rate", 0) * 100,
+            )
+
+            # Notif Telegram kalau ada yang gagal
+            if not summary.get("all_passed", False):
+                failed_names = [
+                    name for name, data in summary.get("scenarios", {}).items()
+                    if not data.get("passed")
+                ]
+                try:
+                    from notifications.telegram_bot import telegram
+                    await telegram.send(
+                        f"CRASH TEST WARNING\n\n"
+                        f"{summary['passed']}/{summary['total']} scenarios passed.\n"
+                        f"Failed: {', '.join(failed_names)}\n\n"
+                        f"Bot mungkin tidak survive kondisi market ekstrem. "
+                        f"Cek log untuk detail."
+                    )
+                except Exception:
+                    pass
     except Exception as e:
-        log.error("Crash test orchestrator error: %s", e)
+        log.error("Crash test orchestrator error: %s", e, exc_info=True)
 
 
 async def cleanup_old_news():
