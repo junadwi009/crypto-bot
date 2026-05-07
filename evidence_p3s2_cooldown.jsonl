@@ -1,0 +1,11 @@
+{"actual": false, "expected": false, "fixture": "empty_history", "pair": "BTC/USDT", "ts": "2026-05-07T08:50:05.310571+00:00", "verdict": "PASS"}
+{"actual": false, "expected": false, "fixture": "streak_below_threshold_30min_old", "pair": "BTC/USDT", "ts": "2026-05-07T08:50:05.310864+00:00", "verdict": "PASS"}
+{"actual": true, "expected": true, "fixture": "threshold_run_within_60min", "pair": "BTC/USDT", "ts": "2026-05-07T08:50:05.311134+00:00", "verdict": "PASS"}
+{"actual": false, "expected": false, "fixture": "threshold_run_older_than_60min", "pair": "BTC/USDT", "ts": "2026-05-07T08:50:05.311411+00:00", "verdict": "PASS"}
+{"actual": true, "expected": true, "fixture": "at_60_minute_boundary_inside", "pair": "BTC/USDT", "ts": "2026-05-07T08:50:05.311677+00:00", "verdict": "PASS"}
+{"actual": true, "expected": true, "fixture": "persists_across_winning_trades_within_window", "pair": "BTC/USDT", "ts": "2026-05-07T08:50:05.311931+00:00", "verdict": "PASS"}
+{"actual": false, "expected": false, "fixture": "only_recent_run_below_threshold", "pair": "BTC/USDT", "ts": "2026-05-07T08:50:05.312186+00:00", "verdict": "PASS"}
+{"actual": true, "expected": true, "fixture": "most_recent_qualifying_run_drives_cooldown", "pair": "BTC/USDT", "ts": "2026-05-07T08:50:05.312438+00:00", "verdict": "PASS"}
+{"actual": false, "expected": false, "fixture": "filtered_by_pair_other_pair_in_cooldown", "pair": "BTC/USDT", "ts": "2026-05-07T08:50:05.312685+00:00", "verdict": "PASS"}
+{"actual": false, "expected": false, "fixture": "breakeven_resets_streak", "pair": "BTC/USDT", "ts": "2026-05-07T08:50:05.312931+00:00", "verdict": "PASS"}
+{"actual": false, "expected": false, "fixture": "db_failure_safe_default", "pair": "BTC/USDT", "ts": "2026-05-07T08:50:05.313915+00:00", "verdict": "PASS"}

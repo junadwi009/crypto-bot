@@ -90,7 +90,7 @@ redis = acl.for_module(__name__)
 # ─────────────────────────────────────────────────────────────────
 # Versioning (Council constraint 13: monotonic, never reused)
 # ─────────────────────────────────────────────────────────────────
-ORCHESTRATOR_VERSION = "0.3.0-observe-with-cl"
+ORCHESTRATOR_VERSION = "0.4.0-observe-with-cl-cooldown"
 
 # LAYER_INPUTS_SCHEMA_VERSION HISTORY (append-only, never edit prior entries)
 #
@@ -107,8 +107,20 @@ ORCHESTRATOR_VERSION = "0.3.0-observe-with-cl"
 #                                  Used by counterfactual veto branch.
 #   v1 semantics unchanged; v2 is a strict superset.
 #
+# v3 (Phase 3 Step 2, 2026-05-07):
+#   v2 keys plus:
+#     consecutive_losses_cooldown_active (bool)
+#       — purely-derived predicate from governance.consecutive_losses.
+#         True iff some contiguous loss-run on this pair reached
+#         CONSECUTIVE_LOSS_THRESHOLD and its most-recent in-run loss
+#         closed within COOLDOWN_DURATION_MINUTES of now. Duration-only
+#         end condition: winning trades after the threshold-crossing
+#         loss do NOT clear cooldown early. No new write surface, no
+#         ACL change, no migration — observe-only purity preserved.
+#   v2 semantics unchanged; v3 is a strict superset.
+#
 # Future bumps append below with rationale. NEVER mutate prior entries.
-LAYER_INPUTS_SCHEMA_VERSION = 2
+LAYER_INPUTS_SCHEMA_VERSION = 3
 
 # Observe-only flag — Phase 3 promotion is the ONLY way this flips.
 ORCHESTRATOR_OBSERVE_ONLY = os.getenv("ORCHESTRATOR_OBSERVE_ONLY", "true").lower() != "false"
@@ -284,13 +296,14 @@ class Orchestrator:
         proposed_sl: float | None,
         proposed_tp: float | None,
     ) -> dict:
-        """Snapshot all inputs needed for replay. Schema v2 (Phase 3 Step 1).
+        """Snapshot all inputs needed for replay. Schema v3 (Phase 3 Step 2).
 
         Required keys (Council mandate constraint 6):
           schema_version, kernel_hash, kernel_version, orchestrator_version,
           governance_mode, reconciliation_raw, reconciliation_implication.
 
         Phase 3 Step 1 adds: consecutive_losses (int).
+        Phase 3 Step 2 adds: consecutive_losses_cooldown_active (bool).
         """
         recon_raw = await recon_last_status()
         recon_implication = RECON_TO_GOVERNANCE[recon_raw]
@@ -320,6 +333,21 @@ class Orchestrator:
                       pair, e)
             cl_count = 0
 
+        # Phase 3 Step 2: cooldown predicate (purely derived; read-only).
+        # Same propagation contract as the tracker. Defaults to False on
+        # any non-L0 error — safe direction (do not invent a cooldown).
+        try:
+            from governance.consecutive_losses import is_in_cooldown
+            cl_cooldown = await is_in_cooldown(pair)
+        except RedisACLViolation:
+            raise
+        except LayerZeroViolation:
+            raise
+        except Exception as e:
+            log.error("orchestrator: cooldown lookup failed for %s: %s",
+                      pair, e)
+            cl_cooldown = False
+
         return {
             "schema_version":             LAYER_INPUTS_SCHEMA_VERSION,
             "kernel_hash":                L0.KERNEL_HASH[:16],
@@ -333,6 +361,8 @@ class Orchestrator:
             "reconciliation_implication": recon_implication,
             # Phase 3 Step 1: per-pair loss streak
             "consecutive_losses":         int(cl_count or 0),
+            # Phase 3 Step 2: per-pair cooldown predicate (derived)
+            "consecutive_losses_cooldown_active": bool(cl_cooldown),
             # Pipeline snapshot
             "pair":          pair,
             "stage_reached": pipeline_state.get("stage_reached", "unknown"),
@@ -365,10 +395,17 @@ class Orchestrator:
             Veto string: f"consecutive_losses_{N}_on_{pair}".
             Mode escalation only — frozen wins over restricted.
 
-        Veto-list ordering is deterministic: recon → losses. Ordering is
-        part of the R3 hash identity (constraint: stable list ordering
-        preserved). DO NOT reorder these branches without bumping
-        ORCHESTRATOR_VERSION and adding a HISTORY entry.
+        Phase 3 Step 2 veto (additive — also recorded only):
+          - consecutive_losses_cooldown_active is True for this pair
+            → mode = restricted (size × 0.5) when no stricter mode active.
+            Veto string: f"consecutive_losses_cooldown_on_{pair}".
+            Fires independently of streak — both can apply on the same row.
+            Hold-requests bypass (matches Step 1 convention for non-actions).
+
+        Veto-list ordering is deterministic: recon → streak-losses →
+        cooldown. Ordering is part of the R3 hash identity (constraint:
+        stable list ordering preserved). DO NOT reorder these branches
+        without bumping ORCHESTRATOR_VERSION and adding a HISTORY entry.
 
         Returns dict with action, size_usd, size_scale, mode, vetoes.
         """
@@ -407,6 +444,20 @@ class Orchestrator:
         from governance.consecutive_losses import CONSECUTIVE_LOSS_THRESHOLD
         if cl_count >= CONSECUTIVE_LOSS_THRESHOLD and requested_action != "hold":
             vetoes.append(f"consecutive_losses_{cl_count}_on_{cl_pair}")
+            if mode == "normal":
+                mode = "restricted"
+                scale = 0.5
+                size = float(proposed_size_usd or 0) * scale
+
+        # Phase 3 Step 2: cooldown veto. Append AFTER the streak veto so
+        # ordering remains: recon → streak-losses → cooldown. Mode escalation
+        # only; frozen still wins. Hold-requests bypass — non-actions don't
+        # need a sizing veto.
+        cl_cooldown_active = bool(
+            layer_inputs.get("consecutive_losses_cooldown_active", False)
+        )
+        if cl_cooldown_active and requested_action != "hold":
+            vetoes.append(f"consecutive_losses_cooldown_on_{cl_pair}")
             if mode == "normal":
                 mode = "restricted"
                 scale = 0.5
