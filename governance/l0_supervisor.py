@@ -78,8 +78,22 @@ SOFT_TRIGGER_ALERT_THRESHOLD = 3   # alert SEV-0 at 3+/hour
 #   structured error log. Placeholder string "phase3" never appears at v2.
 #   All other fields' semantics are unchanged.
 #
+# v3 (Phase 3 Step 4, 2026-05-07):
+#   v2 keys plus:
+#     cb_state_l0      (bool | None) — raw value of l0:circuit_breaker_tripped
+#                                       returned by _check_cb_coherence().
+#                                       None when the key is unset (preserves
+#                                       distinction from explicit false).
+#     cb_state_legacy  (bool | None) — raw value of the legacy unprefixed
+#                                       circuit_breaker_tripped key (read via
+#                                       raw redis client during the transition
+#                                       window). None when unset.
+#   Existing cb_state_consistency derivation is unchanged. No new write
+#   surface is introduced — supervisor only reads. Preparation for the
+#   eventual CB-extraction (B3); not the extraction itself.
+#
 # Future bumps append below with rationale. NEVER mutate prior entries.
-CYCLE_LOG_SCHEMA_VERSION = 2
+CYCLE_LOG_SCHEMA_VERSION = 3
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -258,6 +272,10 @@ async def supervise() -> None:
             "event":                    "l0_supervisor_cycle",
             "kernel_hash_status":       "unknown",
             "cb_state_consistency":     "unknown",
+            # Phase 3 Step 4: raw CB state. None = key unset (distinct
+            # from explicit False).
+            "cb_state_l0":              None,
+            "cb_state_legacy":          None,
             "supervisor_unhealthy":     "unknown",
             "soft_mode_trigger_count":  -1,
             "reconciliation_status":    recon_status_str,
@@ -276,8 +294,15 @@ async def supervise() -> None:
             # at import. Re-compare with file-on-disk.
             cycle_event["kernel_hash_status"] = await _check_kernel_hash()
 
-            # 3. CB-vs-pause coherence check
-            cycle_event["cb_state_consistency"] = await _check_cb_coherence()
+            # 3. CB-vs-pause coherence check.
+            # Phase 3 Step 4: _check_cb_coherence now returns a 3-tuple so
+            # the raw CB state values can be recorded in the cycle log
+            # alongside the derived coherence verdict. The verdict-derivation
+            # logic itself is unchanged — only the return shape is widened.
+            cb_consistency, cb_state_l0, cb_state_legacy = await _check_cb_coherence()
+            cycle_event["cb_state_consistency"] = cb_consistency
+            cycle_event["cb_state_l0"]          = cb_state_l0
+            cycle_event["cb_state_legacy"]      = cb_state_legacy
 
             # 4. Health flag state
             unhealthy = await redis.get("l0:supervisor_unhealthy")
@@ -353,34 +378,54 @@ async def _check_kernel_hash() -> str:
     return "ok"
 
 
-async def _check_cb_coherence() -> str:
+async def _check_cb_coherence() -> tuple[str, bool | None, bool | None]:
     """If circuit_breaker_tripped is set, bot_paused must also be set.
     Inverse is allowed (operator pause without CB trip).
+
+    Phase 3 Step 4 (B3-prep): returns a 3-tuple
+        (coherence_status, cb_state_l0, cb_state_legacy)
+    so the supervisor cycle log can record raw CB state alongside the
+    derived coherence verdict.
+
+    cb_state_l0      raw bool of l0:circuit_breaker_tripped, or None when
+                     the key is unset (preserves the absent-vs-explicit-false
+                     distinction the Council mandated).
+    cb_state_legacy  raw bool of legacy unprefixed circuit_breaker_tripped,
+                     or None when unset.
+
+    No new write surface is introduced. The pre-existing REPAIR path
+    (writing l0:bot_paused when CB is tripped but pause flag is unset)
+    is preserved verbatim — the only behavior delta is that BOTH raw
+    values are now read every cycle (previously the legacy key was read
+    only when the l0 key was falsy). Each key is still read at most once
+    per cycle — no double reads.
     """
     try:
-        cb = await redis.get("l0:circuit_breaker_tripped")
-        # legacy key still consulted for transition
-        legacy_cb = None
-        if not cb:
-            # Legacy CB still writes to non-prefixed key during transition.
-            # Read via raw client is acceptable here because we are the
-            # supervisor and we are explicitly watching legacy state.
-            from utils.redis_client import redis as _raw
-            legacy_cb = await _raw.get("circuit_breaker_tripped")
-        cb_set = bool(cb or legacy_cb)
+        cb_l0_raw = await redis.get("l0:circuit_breaker_tripped")
+        # Legacy CB still writes to non-prefixed key during transition.
+        # Read via raw client is acceptable here because we are the
+        # supervisor and we are explicitly watching legacy state.
+        from utils.redis_client import redis as _raw
+        cb_legacy_raw = await _raw.get("circuit_breaker_tripped")
+
+        # Preserve None vs explicit-false distinction (Council-locked).
+        cb_state_l0 = None if cb_l0_raw is None else bool(cb_l0_raw)
+        cb_state_legacy = None if cb_legacy_raw is None else bool(cb_legacy_raw)
+
+        cb_set = bool(cb_l0_raw or cb_legacy_raw)
         paused = bool(await redis.get("l0:bot_paused"))
         if cb_set and not paused:
             log.critical("CB tripped but bot_paused unset — coherence violation")
             await redis.set("l0:bot_paused", "1")
-            return "REPAIRED_paused_set_to_match_cb"
-        return "ok"
+            return ("REPAIRED_paused_set_to_match_cb", cb_state_l0, cb_state_legacy)
+        return ("ok", cb_state_l0, cb_state_legacy)
     except RedisACLViolation:
         raise
     except LayerZeroViolation:
         raise
     except Exception as e:
         log.error("cb coherence check failed: %s", e)
-        return "check_error"
+        return ("check_error", None, None)
 
 
 async def _clear_supervisor_unhealthy(clean_streak: int) -> None:

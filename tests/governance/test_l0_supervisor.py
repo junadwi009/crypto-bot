@@ -114,7 +114,7 @@ async def test_supervisor_loop_survives_redis_check_failure():
          patch.object(l0_supervisor, "_check_kernel_hash",
                       new=AsyncMock(return_value="ok")), \
          patch.object(l0_supervisor, "_check_cb_coherence",
-                      new=AsyncMock(return_value="ok")), \
+                      new=AsyncMock(return_value=("ok", None, None))), \
          patch.object(l0_supervisor, "recon_last_status",
                       new=AsyncMock(return_value=ReconciliationStatus.CLEAN)), \
          patch.object(l0_supervisor, "SUPERVISOR_TICK_SECONDS", 0.01):
@@ -202,7 +202,7 @@ async def _run_one_cycle(recon_mock, redis_get_return=None):
          patch.object(l0_supervisor, "_check_kernel_hash",
                       new=AsyncMock(return_value="ok")), \
          patch.object(l0_supervisor, "_check_cb_coherence",
-                      new=AsyncMock(return_value="ok")), \
+                      new=AsyncMock(return_value=("ok", None, None))), \
          patch.object(l0_supervisor, "recon_last_status",
                       new=recon_mock), \
          patch.object(l0_supervisor, "SUPERVISOR_TICK_SECONDS", 0.01), \
@@ -296,7 +296,7 @@ async def test_cycle_log_layer_zero_violation_from_recon_propagates():
          patch.object(l0_supervisor, "_check_kernel_hash",
                       new=AsyncMock(return_value="ok")), \
          patch.object(l0_supervisor, "_check_cb_coherence",
-                      new=AsyncMock(return_value="ok")), \
+                      new=AsyncMock(return_value=("ok", None, None))), \
          patch.object(l0_supervisor, "recon_last_status",
                       new=AsyncMock(side_effect=LayerZeroViolation(
                           reason="synthetic recon L0 violation",
@@ -318,7 +318,7 @@ async def test_cycle_log_redis_acl_violation_from_recon_propagates():
          patch.object(l0_supervisor, "_check_kernel_hash",
                       new=AsyncMock(return_value="ok")), \
          patch.object(l0_supervisor, "_check_cb_coherence",
-                      new=AsyncMock(return_value="ok")), \
+                      new=AsyncMock(return_value=("ok", None, None))), \
          patch.object(l0_supervisor, "recon_last_status",
                       new=AsyncMock(side_effect=RedisACLViolation(
                           caller="test.synthetic",
@@ -336,22 +336,30 @@ async def test_cycle_log_redis_acl_violation_from_recon_propagates():
 
 # ── Schema version + HISTORY block ─────────────────────────────────────
 
-def test_cycle_log_schema_version_bumped_to_two():
-    """Constraint 13: schema version monotonic (1 → 2)."""
-    assert l0_supervisor.CYCLE_LOG_SCHEMA_VERSION == 2
+def test_cycle_log_schema_version_is_current():
+    """Constraint 13: schema version monotonic. After Step 4 the live
+    value is 3; the test reads the constant so it remains valid through
+    future bumps."""
     assert isinstance(l0_supervisor.CYCLE_LOG_SCHEMA_VERSION, int)
+    assert l0_supervisor.CYCLE_LOG_SCHEMA_VERSION >= 2  # Step 3 lower bound
+    assert l0_supervisor.CYCLE_LOG_SCHEMA_VERSION == 3  # Step 4 current
 
 
-def test_cycle_log_history_block_v1_and_v2_present():
-    """Append-only HISTORY: v1 entry must remain verbatim; v2 entry added."""
+def test_cycle_log_history_block_all_versions_present():
+    """Append-only HISTORY: v1 + v2 entries must remain verbatim; v3 entry
+    appended for Step 4."""
     import inspect
     src = inspect.getsource(l0_supervisor)
     assert "v1 (Phase 2, original):" in src
     assert "v2 (Phase 3 Step 3" in src
+    assert "v3 (Phase 3 Step 4" in src
     # v1 placeholder description must remain — proves v1 entry not edited
     assert "carried the literal placeholder string \"phase3\"" in src
-    # v2 description must mention live-value source
+    # v2 description must mention live-value source — proves v2 not edited
     assert "governance.reconciliation.last_status()" in src
+    # v3 description must mention raw CB state additions
+    assert "cb_state_l0" in src
+    assert "cb_state_legacy" in src
 
 
 # ── Decision-logic invariance: clean-streak unaffected by recon state ──
@@ -387,7 +395,7 @@ async def test_cycle_event_schema_version_field_reflects_constant():
     assert len(events) >= 1
     for e in events:
         assert e["schema_version"] == l0_supervisor.CYCLE_LOG_SCHEMA_VERSION
-        assert e["schema_version"] == 2
+        assert e["schema_version"] == 3
 
 
 # ── Recon ingestion happens BEFORE cycle_event construction ────────────
@@ -410,7 +418,7 @@ async def test_recon_called_before_cycle_event_construction():
 
     async def cb_after():
         call_order.append("cb_coherence")
-        return "ok"
+        return ("ok", None, None)
 
     with patch.object(l0_supervisor, "redis") as fake_redis, \
          patch.object(l0_supervisor, "recon_last_status", side_effect=recon_first), \
@@ -433,3 +441,269 @@ async def test_recon_called_before_cycle_event_construction():
     assert call_order[0] == "recon"
     assert call_order[1] == "kernel_hash"
     assert call_order[2] == "cb_coherence"
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Phase 3 Step 4 (B3-prep) — raw CB state recorded in cycle log
+# ════════════════════════════════════════════════════════════════════════
+
+# ── Helper: drive supervise() with a specific (cb_l0, cb_legacy) tuple ─
+
+async def _run_one_cycle_with_cb_state(cb_l0, cb_legacy):
+    """Drive supervise() through ~one tick and capture cycle_event payloads,
+    with `_check_cb_coherence` patched to return a controlled tuple
+    `("ok", cb_l0, cb_legacy)`. recon is mocked CLEAN to keep that
+    dimension constant across all fixture variations."""
+    captured = []
+
+    def capture_info(msg, *args, **kwargs):
+        if msg == "L0_CYCLE %s" and args:
+            captured.append(json.loads(args[0]))
+
+    with patch.object(l0_supervisor, "redis") as fake_redis, \
+         patch.object(l0_supervisor, "_check_kernel_hash",
+                      new=AsyncMock(return_value="ok")), \
+         patch.object(l0_supervisor, "_check_cb_coherence",
+                      new=AsyncMock(return_value=("ok", cb_l0, cb_legacy))), \
+         patch.object(l0_supervisor, "recon_last_status",
+                      new=AsyncMock(return_value=ReconciliationStatus.CLEAN)), \
+         patch.object(l0_supervisor, "SUPERVISOR_TICK_SECONDS", 0.01), \
+         patch.object(l0_supervisor.log, "info",
+                      side_effect=capture_info):
+        fake_redis.set = AsyncMock(return_value=True)
+        fake_redis.get = AsyncMock(return_value=None)
+
+        task = asyncio.create_task(l0_supervisor.supervise())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    return captured
+
+
+# ── 5-combination fixture matrix (Council-approved) ────────────────────
+
+@pytest.mark.asyncio
+async def test_cycle_log_cb_state_none_none():
+    events = await _run_one_cycle_with_cb_state(None, None)
+    assert len(events) >= 1
+    for e in events:
+        assert e["cb_state_l0"] is None
+        assert e["cb_state_legacy"] is None
+
+
+@pytest.mark.asyncio
+async def test_cycle_log_cb_state_false_false():
+    events = await _run_one_cycle_with_cb_state(False, False)
+    assert len(events) >= 1
+    for e in events:
+        assert e["cb_state_l0"] is False
+        assert e["cb_state_legacy"] is False
+
+
+@pytest.mark.asyncio
+async def test_cycle_log_cb_state_true_none():
+    events = await _run_one_cycle_with_cb_state(True, None)
+    assert len(events) >= 1
+    for e in events:
+        assert e["cb_state_l0"] is True
+        assert e["cb_state_legacy"] is None
+
+
+@pytest.mark.asyncio
+async def test_cycle_log_cb_state_none_true():
+    events = await _run_one_cycle_with_cb_state(None, True)
+    assert len(events) >= 1
+    for e in events:
+        assert e["cb_state_l0"] is None
+        assert e["cb_state_legacy"] is True
+
+
+@pytest.mark.asyncio
+async def test_cycle_log_cb_state_true_true():
+    events = await _run_one_cycle_with_cb_state(True, True)
+    assert len(events) >= 1
+    for e in events:
+        assert e["cb_state_l0"] is True
+        assert e["cb_state_legacy"] is True
+
+
+# ── None-vs-False distinction is preserved end-to-end ──────────────────
+
+@pytest.mark.asyncio
+async def test_cycle_log_distinguishes_none_from_false():
+    """Council-locked: None (key unset) and False (key set, falsy) must
+    NOT be conflated in the cycle log. Compares cycle_events for
+    (None, None) vs (False, False) and verifies they are NOT byte-equal."""
+    events_none = await _run_one_cycle_with_cb_state(None, None)
+    events_false = await _run_one_cycle_with_cb_state(False, False)
+    assert events_none and events_false
+    canon_none  = json.dumps({k: v for k, v in events_none[0].items()
+                              if k not in {"loop_latency_ms", "ts"}},
+                             sort_keys=True)
+    canon_false = json.dumps({k: v for k, v in events_false[0].items()
+                              if k not in {"loop_latency_ms", "ts"}},
+                             sort_keys=True)
+    assert canon_none != canon_false
+
+
+# ── Byte-identical proof for non-CB / non-recon decision fields ────────
+
+@pytest.mark.asyncio
+async def test_non_cb_non_recon_decision_fields_byte_identical_across_cb_states():
+    """Across all 5 CB-state combinations (None,None), (False,False),
+    (True,None), (None,True), (True,True), the supervisor decision
+    fields OTHER than cb_state_l0 / cb_state_legacy / loop_latency_ms /
+    ts must be byte-identical — i.e. Step 4 ingestion is purely additive."""
+    fixtures = [
+        (None,  None),
+        (False, False),
+        (True,  None),
+        (None,  True),
+        (True,  True),
+    ]
+    canonical_per_fixture: dict[tuple, str] = {}
+    for cb_l0, cb_legacy in fixtures:
+        events = await _run_one_cycle_with_cb_state(cb_l0, cb_legacy)
+        assert events, f"no cycle events for fixture {(cb_l0, cb_legacy)}"
+        ev = events[0]
+        stripped = {
+            k: v for k, v in ev.items()
+            if k not in {
+                "loop_latency_ms", "ts",
+                "cb_state_l0", "cb_state_legacy",
+            }
+        }
+        canonical_per_fixture[(cb_l0, cb_legacy)] = json.dumps(
+            stripped, sort_keys=True, separators=(",", ":"),
+        )
+    assert len(set(canonical_per_fixture.values())) == 1, (
+        "non-CB / non-recon decision fields drift across CB-state fixtures: "
+        f"{canonical_per_fixture}"
+    )
+
+
+# ── Direct integration test of the refactored _check_cb_coherence ──────
+
+@pytest.mark.asyncio
+async def test_check_cb_coherence_returns_tuple_with_raw_values():
+    """The refactored function must return a 3-tuple. Raw values reflect
+    what redis.get returned, with None preserved when a key is unset."""
+    with patch.object(l0_supervisor, "redis") as fake_l0_redis, \
+         patch("utils.redis_client.redis") as fake_raw_redis:
+        # l0:circuit_breaker_tripped → set to "1"; legacy → unset
+        fake_l0_redis.get = AsyncMock(side_effect=lambda key: {
+            "l0:circuit_breaker_tripped": "1",
+            "l0:bot_paused":              "1",
+        }.get(key))
+        fake_l0_redis.set = AsyncMock()
+        fake_raw_redis.get = AsyncMock(return_value=None)
+
+        status, cb_l0, cb_legacy = await l0_supervisor._check_cb_coherence()
+        assert status == "ok"
+        assert cb_l0 is True
+        assert cb_legacy is None
+
+
+@pytest.mark.asyncio
+async def test_check_cb_coherence_only_legacy_set():
+    """Legacy unprefixed key set, l0 key unset — supervisor must record
+    legacy raw True alongside l0 raw None, and (since CB is set but
+    bot_paused is unset) trigger the existing REPAIR path."""
+    with patch.object(l0_supervisor, "redis") as fake_l0_redis, \
+         patch("utils.redis_client.redis") as fake_raw_redis:
+        fake_l0_redis.get = AsyncMock(side_effect=lambda key: {
+            # l0:circuit_breaker_tripped UNSET
+            "l0:bot_paused":              None,
+        }.get(key))
+        fake_l0_redis.set = AsyncMock()
+        fake_raw_redis.get = AsyncMock(return_value="1")
+
+        status, cb_l0, cb_legacy = await l0_supervisor._check_cb_coherence()
+        assert status == "REPAIRED_paused_set_to_match_cb"
+        assert cb_l0 is None
+        assert cb_legacy is True
+
+
+@pytest.mark.asyncio
+async def test_check_cb_coherence_both_unset():
+    """Both keys unset → cb_state_l0 and cb_state_legacy both None."""
+    with patch.object(l0_supervisor, "redis") as fake_l0_redis, \
+         patch("utils.redis_client.redis") as fake_raw_redis:
+        fake_l0_redis.get = AsyncMock(return_value=None)
+        fake_l0_redis.set = AsyncMock()
+        fake_raw_redis.get = AsyncMock(return_value=None)
+
+        status, cb_l0, cb_legacy = await l0_supervisor._check_cb_coherence()
+        assert status == "ok"
+        assert cb_l0 is None
+        assert cb_legacy is None
+
+
+@pytest.mark.asyncio
+async def test_check_cb_coherence_layer_zero_violation_propagates():
+    """LayerZeroViolation from a Redis read inside coherence must propagate."""
+    with patch.object(l0_supervisor, "redis") as fake_l0_redis:
+        fake_l0_redis.get = AsyncMock(side_effect=LayerZeroViolation(
+            reason="synthetic l0 violation in cb read",
+            source_module="test",
+        ))
+        fake_l0_redis.set = AsyncMock()
+        with pytest.raises(LayerZeroViolation) as exc:
+            await l0_supervisor._check_cb_coherence()
+        assert "synthetic l0 violation in cb read" in exc.value.reason
+
+
+@pytest.mark.asyncio
+async def test_check_cb_coherence_redis_acl_violation_propagates():
+    """RedisACLViolation must propagate as a governance-boundary error."""
+    with patch.object(l0_supervisor, "redis") as fake_l0_redis:
+        fake_l0_redis.get = AsyncMock(side_effect=RedisACLViolation(
+            caller="test.synthetic",
+            attempted_op="get",
+            attempted_key="l0:circuit_breaker_tripped",
+            allowed_prefixes=frozenset({"l2:"}),
+        ))
+        fake_l0_redis.set = AsyncMock()
+        with pytest.raises(RedisACLViolation):
+            await l0_supervisor._check_cb_coherence()
+
+
+@pytest.mark.asyncio
+async def test_check_cb_coherence_other_exception_returns_safe_tuple():
+    """Non-L0 exceptions are logged and a safe tuple is returned."""
+    with patch.object(l0_supervisor, "redis") as fake_l0_redis:
+        fake_l0_redis.get = AsyncMock(side_effect=RuntimeError("redis hiccup"))
+        fake_l0_redis.set = AsyncMock()
+        status, cb_l0, cb_legacy = await l0_supervisor._check_cb_coherence()
+        assert status == "check_error"
+        assert cb_l0 is None
+        assert cb_legacy is None
+
+
+# ── No-new-write-surface: supervisor's CALLER_PREFIX_RULES unchanged ───
+
+def test_supervisor_caller_prefix_rules_unchanged_at_step4():
+    """Council-locked: Step 4 introduces no new ACL prefix. Supervisor's
+    write authority must remain exactly {l0:} as it was at Steps 1-3."""
+    from governance.redis_acl import CALLER_PREFIX_RULES
+    assert CALLER_PREFIX_RULES["governance.l0_supervisor"] == frozenset({"l0:"})
+
+
+# ── cycle_event field set composition ──────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_cycle_event_contains_both_step4_keys():
+    events = await _run_one_cycle_with_cb_state(False, True)
+    assert events
+    e = events[0]
+    assert "cb_state_l0" in e
+    assert "cb_state_legacy" in e
+    # And v1/v2 keys still present (strict superset preservation)
+    for k in ["schema_version", "event", "kernel_hash_status",
+              "cb_state_consistency", "supervisor_unhealthy",
+              "soft_mode_trigger_count", "reconciliation_status",
+              "loop_latency_ms", "ts"]:
+        assert k in e, f"v1/v2 key {k!r} missing at v3"
