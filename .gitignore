@@ -39,3 +39,6 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code metadata (worktrees, settings.local.json, agent state)
+.claude/
