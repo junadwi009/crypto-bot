@@ -34,15 +34,34 @@ from brains.credit_monitor import credit_monitor
 from news.fetcher import news_fetcher
 from notifications.telegram_bot import telegram
 from schedulers.main_scheduler import BotScheduler
+from governance.exceptions import LayerZeroViolation
+from governance.redis_acl import RedisACLViolation
+from governance import safety_kernel as L0
+from governance import l0_supervisor
 
 setup_logging()
 log = logging.getLogger("main")
+
+# Soft-mode discipline maintained from Phase 1. The l0_supervisor module
+# owns interpretation; main.py only reads the env for boot-time logging.
+L0_SUPERVISOR_HARD_EXIT = os.getenv("L0_SUPERVISOR_HARD_EXIT", "false").lower() == "true"
 
 _stopping = False
 
 
 def is_stopping() -> bool:
     return _stopping
+
+
+async def _on_layer_zero_violation(violation: LayerZeroViolation, source_loop: str) -> None:
+    """Phase-2 supervisor boundary handler — DELEGATES to governance.l0_supervisor.
+
+    Constraint 17: l0:supervisor_unhealthy / l0:bot_paused / l0:soft_mode_triggers
+    are owned exclusively by governance.l0_supervisor. main.py no longer
+    writes those keys directly. The handler in l0_supervisor.on_layer_zero_violation
+    persists state, emits alerts, and decides hard/soft exit.
+    """
+    await l0_supervisor.on_layer_zero_violation(violation, source_loop=source_loop)
 
 
 async def trading_loop():
@@ -65,6 +84,8 @@ async def trading_loop():
                     capital_now   = await db.get_current_capital()
                     if capital_start > 0:
                         await circuit_breaker.check(capital_now, capital_start)
+            except LayerZeroViolation:
+                raise
             except Exception as e:
                 log.debug("CB inline check skipped: %s", e)
 
@@ -77,6 +98,12 @@ async def trading_loop():
 
         except asyncio.CancelledError:
             break
+        except LayerZeroViolation as v:
+            # Phase 1 supervisor boundary — handle, then PROPAGATE.
+            # Propagating ensures the violation is visible at outer task supervisor
+            # in main(), where the decision to hard-exit is centralized.
+            await _on_layer_zero_violation(v, source_loop="trading_loop")
+            raise
         except Exception as e:
             log.error("Trading loop error: %s", e, exc_info=True)
             await asyncio.sleep(10)
@@ -90,6 +117,9 @@ async def news_loop():
             await asyncio.sleep(15 * 60)
         except asyncio.CancelledError:
             break
+        except LayerZeroViolation as v:
+            await _on_layer_zero_violation(v, source_loop="news_loop")
+            raise
         except Exception as e:
             log.error("News loop error: %s", e, exc_info=True)
             await asyncio.sleep(60)
@@ -103,9 +133,65 @@ async def credit_monitor_loop():
             await asyncio.sleep(60 * 60)
         except asyncio.CancelledError:
             break
+        except LayerZeroViolation as v:
+            await _on_layer_zero_violation(v, source_loop="credit_monitor_loop")
+            raise
         except Exception as e:
             log.error("Credit monitor error: %s", e, exc_info=True)
             await asyncio.sleep(300)
+
+
+async def _close_all_live_positions_on_shutdown() -> None:
+    """M11: graceful shutdown closes live positions.
+
+    In LIVE mode, leaving positions open during shutdown is unsafe — the
+    software-side SL/TP polling is gone for the duration of the restart
+    (now exchange-side SL/TP from M2 still protects, but native stops
+    still need the exchange to honor them; we close to remove all doubt).
+
+    PAPER mode: no-op. There are no real positions.
+
+    Idempotency from M1 (orderLinkId) ensures retry-safe close if the
+    shutdown is interrupted and resumed.
+    """
+    if settings.PAPER_TRADE:
+        log.info("Graceful shutdown: paper mode — no positions to close")
+        return
+
+    try:
+        from exchange.order_manager import order_manager
+        open_trades = await db.get_open_trades(is_paper=False)
+        if not open_trades:
+            log.info("Graceful shutdown: no live positions to close")
+            return
+
+        log.warning(
+            "Graceful shutdown: closing %d live position(s) at market",
+            len(open_trades),
+        )
+        for trade in open_trades:
+            try:
+                await order_manager.close_position(
+                    trade_id    = trade["id"],
+                    pair        = trade["pair"],
+                    amount_usd  = float(trade["amount_usd"]),
+                    entry_price = float(trade["entry_price"]),
+                    reason      = "graceful_shutdown",
+                    side        = trade.get("side", "buy"),
+                )
+            except RedisACLViolation:
+                raise
+            except LayerZeroViolation:
+                raise
+            except Exception as e:
+                log.error("Failed to close %s on shutdown: %s", trade.get("pair"), e)
+        log.info("Graceful shutdown: position close pass complete")
+    except RedisACLViolation:
+        raise
+    except LayerZeroViolation:
+        raise
+    except Exception as e:
+        log.error("Graceful shutdown: position close phase failed: %s", e)
 
 
 async def graceful_shutdown(tasks: list):
@@ -116,11 +202,14 @@ async def graceful_shutdown(tasks: list):
     try:
         await telegram.send(
             "Bot sedang berhenti dengan aman...\n"
-            "Tidak ada order baru yang akan dibuka.\n"
-            "Posisi terbuka tetap berjalan sampai SL/TP."
+            "Posisi LIVE akan ditutup market jika ada.\n"
+            "Posisi PAPER tetap di DB tanpa eksekusi."
         )
     except Exception:
         pass
+
+    # M11: close all live positions before tearing down
+    await _close_all_live_positions_on_shutdown()
 
     await telegram.stop()
     log.info("Telegram polling stopped")
@@ -209,6 +298,10 @@ async def main():
     log.info("  Capital     : $%s", settings.INITIAL_CAPITAL)
     log.info("=" * 50)
 
+    # L0 kernel: log version + hash before any other code runs
+    L0.log_kernel_boot()
+    log.info("L0_SUPERVISOR_HARD_EXIT=%s (Phase 1 soft mode if False)", L0_SUPERVISOR_HARD_EXIT)
+
     validate_secrets()
 
     await db.ping()
@@ -235,12 +328,16 @@ async def main():
 
     scheduler = BotScheduler()
 
+    # Phase 2: independent L0 supervisor task. Runs in parallel; survives
+    # trading-loop crashes. Sole writer of l0:supervisor_unhealthy /
+    # l0:bot_paused / l0:soft_mode_triggers (constraint 17).
     tasks = [
-        asyncio.create_task(trading_loop(),        name="trading"),
-        asyncio.create_task(news_loop(),           name="news"),
-        asyncio.create_task(credit_monitor_loop(), name="credit"),
-        asyncio.create_task(telegram.run(),        name="telegram"),
-        asyncio.create_task(scheduler.start(),     name="scheduler"),
+        asyncio.create_task(l0_supervisor.supervise(), name="l0_supervisor"),
+        asyncio.create_task(trading_loop(),            name="trading"),
+        asyncio.create_task(news_loop(),               name="news"),
+        asyncio.create_task(credit_monitor_loop(),     name="credit"),
+        asyncio.create_task(telegram.run(),            name="telegram"),
+        asyncio.create_task(scheduler.start(),         name="scheduler"),
     ]
 
     loop = asyncio.get_running_loop()
@@ -260,12 +357,56 @@ async def main():
 
     # Render menyediakan PORT env var
     port = int(os.getenv("PORT", "8000"))
+
+    # ── Forwarded-IP trust (Phase 2 — closes P2-R2) ──
+    # P2-R2 (enforcement-blocking): outside dev environments, this code path
+    # MUST fail closed if TRUSTED_PROXY_IPS is unset or contains "*".
+    # Council direction: WARN-only is insufficient because operators revert
+    # to "*" during incidents and forget to restore enforcement.
+    deploy_env = os.getenv("DEPLOY_ENV", "").lower() or os.getenv("ENV", "dev").lower()
+    is_dev = deploy_env in ("dev", "development", "local", "test")
+    trusted_proxies = os.getenv("TRUSTED_PROXY_IPS", "").strip()
+
+    if "*" in trusted_proxies:
+        if is_dev:
+            log.warning(
+                "TRUSTED_PROXY_IPS contains '*' but DEPLOY_ENV=%s — permitted "
+                "in dev only", deploy_env,
+            )
+            forwarded_allow_ips = trusted_proxies
+        else:
+            log.critical(
+                "P2-R2: TRUSTED_PROXY_IPS contains '*' outside dev (DEPLOY_ENV=%s). "
+                "Wildcard would defeat the auth rate limiter via X-Forwarded-For "
+                "spoofing. Refusing to start. Set TRUSTED_PROXY_IPS to Render's "
+                "published proxy CIDR.", deploy_env,
+            )
+            sys.exit(1)
+    elif not trusted_proxies:
+        if is_dev:
+            log.warning(
+                "TRUSTED_PROXY_IPS not set, DEPLOY_ENV=%s — defaulting to 127.0.0.1",
+                deploy_env,
+            )
+            forwarded_allow_ips = "127.0.0.1"
+        else:
+            log.critical(
+                "P2-R2: TRUSTED_PROXY_IPS unset outside dev (DEPLOY_ENV=%s). "
+                "Refusing to start with implicit defaults — operator must set "
+                "TRUSTED_PROXY_IPS to Render's published proxy CIDR.", deploy_env,
+            )
+            sys.exit(1)
+    else:
+        forwarded_allow_ips = trusted_proxies
+        log.info("Trusting forwarded headers from: %s (DEPLOY_ENV=%s)",
+                 forwarded_allow_ips, deploy_env)
+
     config = uvicorn.Config(
         app,
         host       = "0.0.0.0",
         port       = port,
         log_level  = "warning",
-        forwarded_allow_ips = "*",  # Trust Render proxy headers
+        forwarded_allow_ips = forwarded_allow_ips,
     )
     server = uvicorn.Server(config)
     tasks.append(asyncio.create_task(server.serve(), name="health"))
@@ -278,6 +419,20 @@ async def main():
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
         pass
+    except LayerZeroViolation as v:
+        # Last-line supervisor boundary. The loop that raised has already
+        # invoked _on_layer_zero_violation and persisted pause state.
+        # If we reach here, that loop has died — no further trading occurs.
+        log.critical(
+            "L0 VIOLATION reached gather() boundary | %s | other tasks may continue but trading is halted",
+            v,
+        )
+        # In hard mode, _on_layer_zero_violation already called os._exit(2);
+        # this path is only reachable in soft mode. Cancel surviving tasks.
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         log.info("Bot shutdown complete")
 

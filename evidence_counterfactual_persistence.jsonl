@@ -1,0 +1,1 @@
+{"scenario_count": 4, "stage": "summary", "verifies": ["scenario A: passthrough with no vetoes", "scenario B: counterfactual='hold' + vetoes=[recon_unknown] preserved", "scenario C: counterfactual size scaled to 0.5 (size_scale=0.5)", "scenario D: hold action still produces decision row (constraint 18)"]}

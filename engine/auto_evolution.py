@@ -491,17 +491,18 @@ class AutoEvolution:
 
             from database.models import PortfolioSnapshot
             tier = settings.get_tier(new_capital)
+            infra = await db.get_infra_balance()
+            active_pairs = await db.get_active_pairs()
             snap = PortfolioSnapshot(
-                snapshot_date  = date.today(),
-                total_capital  = new_capital,
-                trading_capital= new_capital,
-                infra_fund     = await db.get_infra_balance(),
-                open_positions = len(
-                    await db.get_open_trades(is_paper=settings.PAPER_TRADE)
-                ),
-                daily_pnl      = 0,
-                tier           = tier,
-                paper_trade    = settings.PAPER_TRADE,
+                snapshot_date    = date.today(),
+                total_capital    = new_capital,
+                trading_capital  = max(0, new_capital - infra),
+                infra_reserve    = infra,
+                emergency_buffer = round(new_capital * 0.05, 4),
+                current_tier     = tier,
+                active_pairs     = active_pairs,
+                daily_pnl        = 0,
+                drawdown_pct     = 0,
             )
             await db.save_portfolio_snapshot(snap)
 

@@ -27,11 +27,7 @@ async def take_portfolio_snapshot():
         capital     = await db.get_current_capital()
         open_trades = await db.get_open_trades(is_paper=settings.PAPER_TRADE)
         total_pnl   = await db.get_total_pnl(days=1)
-
-        if capital < 300:    tier = "seed"
-        elif capital < 700:  tier = "growth"
-        elif capital < 1500: tier = "pro"
-        else:                tier = "elite"
+        tier        = settings.get_tier(capital)
 
         try:
             infra = await db.get_infra_balance()
@@ -39,21 +35,37 @@ async def take_portfolio_snapshot():
             log.warning("Could not read infra balance: %s", e)
             infra = 0.0
 
+        # Compute drawdown vs. recent peak so the dashboard chart isn't
+        # always 0%. Look back 30 days; if no history yet, drawdown is 0.
+        try:
+            history = await db.get_portfolio_history(days=30)
+            peak = max((float(r.get("total_capital") or 0) for r in history),
+                       default=capital)
+            drawdown_pct = max(0.0, (peak - capital) / peak) if peak > 0 else 0.0
+        except Exception:
+            drawdown_pct = 0.0
+
+        active_pairs = await db.get_active_pairs()
+
+        # NB: PortfolioSnapshot field names match schema (infra_reserve,
+        # current_tier). Using infra_fund/tier/paper_trade/open_positions
+        # raises ValidationError, which silently ate every prior snapshot.
         snap = PortfolioSnapshot(
-            snapshot_date  = date.today(),
-            total_capital  = capital,
-            trading_capital= max(0, capital - infra),
-            infra_fund     = infra,
-            open_positions = len(open_trades),
-            daily_pnl      = total_pnl,
-            tier           = tier,
-            paper_trade    = settings.PAPER_TRADE,
+            snapshot_date    = date.today(),
+            total_capital    = capital,
+            trading_capital  = max(0, capital - infra),
+            infra_reserve    = infra,
+            emergency_buffer = round(capital * 0.05, 4),
+            current_tier     = tier,
+            active_pairs     = active_pairs,
+            daily_pnl        = total_pnl,
+            drawdown_pct     = round(drawdown_pct, 4),
         )
         await db.save_portfolio_snapshot(snap)
-        log.info("Snapshot saved: tier=%s capital=$%.2f infra=$%.2f open=%d daily_pnl=$%.2f",
-                 tier, capital, infra, len(open_trades), total_pnl)
+        log.info("Snapshot saved: tier=%s capital=$%.2f infra=$%.2f open=%d daily_pnl=$%.2f dd=%.2f%%",
+                 tier, capital, infra, len(open_trades), total_pnl, drawdown_pct * 100)
     except Exception as e:
-        log.error("Portfolio snapshot error: %s", e)
+        log.error("Portfolio snapshot error: %s", e, exc_info=True)
 
 
 async def run_payment_reminder():

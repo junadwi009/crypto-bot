@@ -1,0 +1,2 @@
+{"attempted_key": "l0:bot_paused", "caller": "engine.signal_generator", "is_baseexception": true, "is_exception": false, "stage": "violation_propagated_through_except_exception", "ts": "2026-05-07T07:07:22.469091+00:00"}
+{"stage": "complete", "ts": "2026-05-07T07:07:22.469120+00:00", "verdict": "PASS"}

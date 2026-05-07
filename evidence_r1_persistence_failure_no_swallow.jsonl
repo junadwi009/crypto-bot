@@ -1,0 +1,2 @@
+{"attempted_key": "l0:bot_paused", "caller": "engine.signal_generator", "is_baseexception": true, "is_exception": false, "stage": "violation_propagated_despite_db_failure", "ts": "2026-05-07T07:07:27.904009+00:00"}
+{"bypassed_except_exception": true, "raised_type": "RedisACLViolation", "stage": "summary", "ts": "2026-05-07T07:07:27.904155+00:00", "verdict": "PASS"}

@@ -1,0 +1,5 @@
+{"stage": "begin", "test": "L2 caller (engine.signal_generator) attempts to write l0:bot_paused", "ts": "2026-05-07T07:07:10.777949+00:00"}
+{"allowed_prefixes": ["l2:"], "caller": "engine.signal_generator", "stage": "client_acquired", "ts": "2026-05-07T07:07:10.778003+00:00"}
+{"allowed_prefixes": ["l2:"], "attempted_key": "l0:bot_paused", "attempted_op": "set", "caller": "engine.signal_generator", "is_baseexception": true, "is_exception": false, "stage": "violation_raised", "ts": "2026-05-07T07:07:21.173944+00:00", "type": "RedisACLViolation"}
+{"attempted_key": "l0:supervisor_unhealthy", "attempted_op": "get", "stage": "verified_bypass_of_except_exception", "ts": "2026-05-07T07:07:21.214195+00:00"}
+{"stage": "complete", "ts": "2026-05-07T07:07:21.214226+00:00", "verdict": "PASS"}

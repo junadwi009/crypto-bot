@@ -1,0 +1,3 @@
+{"allowed": false, "expected": false, "input_state": "l0:supervisor_unhealthy=1", "reason": "l0_supervisor_unhealthy", "stage": "case_unhealthy", "ts": "2026-05-07T07:07:22.413313+00:00", "verdict": "PASS"}
+{"allowed": true, "reason": "ok", "stage": "case_healthy", "ts": "2026-05-07T07:07:22.414609+00:00", "verdict": "PASS"}
+{"allowed": false, "expected": false, "reason": "supervisor_state_unreadable", "stage": "case_redis_unreadable", "ts": "2026-05-07T07:07:22.416301+00:00", "verdict": "PASS"}
