@@ -1,0 +1,5 @@
+{"actual_recon_strs": ["clean"], "captured_cycles": 4, "expected_recon_str": "clean", "fixture": "recon_clean", "ts": "2026-05-07T09:11:30.729939+00:00", "v1_placeholder_absent": true, "verdict": "PASS"}
+{"actual_recon_strs": ["stale"], "captured_cycles": 4, "expected_recon_str": "stale", "fixture": "recon_stale", "ts": "2026-05-07T09:11:30.792410+00:00", "v1_placeholder_absent": true, "verdict": "PASS"}
+{"actual_recon_strs": ["unknown"], "captured_cycles": 3, "expected_recon_str": "unknown", "fixture": "recon_unknown", "ts": "2026-05-07T09:11:30.849623+00:00", "v1_placeholder_absent": true, "verdict": "PASS"}
+{"actual_recon_strs": ["divergent"], "captured_cycles": 4, "expected_recon_str": "divergent", "fixture": "recon_divergent", "ts": "2026-05-07T09:11:30.902704+00:00", "v1_placeholder_absent": true, "verdict": "PASS"}
+{"actual_recon_strs": ["unknown"], "captured_cycles": 4, "expected_recon_str": "unknown", "fixture": "recon_runtime_error_fallback", "ts": "2026-05-07T09:11:30.967746+00:00", "verdict": "PASS"}

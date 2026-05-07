@@ -40,6 +40,9 @@ from datetime import datetime, timezone
 from governance import safety_kernel as L0
 from governance.exceptions import LayerZeroViolation
 from governance.redis_acl import acl, RedisACLViolation
+# Phase 3 Step 3 (B2): live reconciliation-status ingestion into cycle log.
+# Observational only — does NOT influence supervisor decision logic.
+from governance.reconciliation import last_status as recon_last_status
 
 log = logging.getLogger("l0_supervisor")
 
@@ -57,7 +60,26 @@ SOFT_TRIGGER_WINDOW_SECONDS = 3600
 SOFT_TRIGGER_ALERT_THRESHOLD = 3   # alert SEV-0 at 3+/hour
 
 # Structured cycle log schema. Versioned for future ingestion compatibility.
-CYCLE_LOG_SCHEMA_VERSION = 1
+#
+# CYCLE_LOG_SCHEMA_VERSION HISTORY (append-only, never edit prior entries)
+#
+# v1 (Phase 2, original):
+#   {schema_version, event, kernel_hash_status, cb_state_consistency,
+#    supervisor_unhealthy, soft_mode_trigger_count, reconciliation_status,
+#    loop_latency_ms, ts}
+#   reconciliation_status carried the literal placeholder string "phase3"
+#   pending Phase-3 wiring.
+#
+# v2 (Phase 3 Step 3, 2026-05-07):
+#   Same key set. reconciliation_status now carries the live value from
+#   governance.reconciliation.last_status() — one of the
+#   ReconciliationStatus enum values ("clean" / "stale" / "unknown" /
+#   "divergent"). On non-L0 read failure, falls back to "unknown" with a
+#   structured error log. Placeholder string "phase3" never appears at v2.
+#   All other fields' semantics are unchanged.
+#
+# Future bumps append below with rationale. NEVER mutate prior entries.
+CYCLE_LOG_SCHEMA_VERSION = 2
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -200,6 +222,37 @@ async def supervise() -> None:
 
     while True:
         cycle_start = time.monotonic()
+
+        # Phase 3 Step 3 (B2) — Reconciliation-status ingestion.
+        # Council mandate: dedicated step before cycle_event construction;
+        # do NOT interleave with kernel-hash, CB-coherence, or health checks.
+        # Observational only — value is recorded in the structured log but
+        # does not influence the supervisor's clean-streak decision logic
+        # (see is_clean determination below — it considers ONLY kernel_hash
+        # and cb_state_consistency, not reconciliation_status).
+        #
+        # Propagation contract (Council-locked):
+        #   LayerZeroViolation → re-raise (governance-boundary error)
+        #   RedisACLViolation  → re-raise (governance-boundary error)
+        #   any other exception → structured log + safe default "unknown"
+        try:
+            recon_status_value = await recon_last_status()
+            recon_status_str = (
+                recon_status_value.value
+                if hasattr(recon_status_value, "value")
+                else str(recon_status_value)
+            )
+        except RedisACLViolation:
+            raise
+        except LayerZeroViolation:
+            raise
+        except Exception as e:
+            log.error(
+                "L0 supervisor: recon_last_status read failed (%s) — "
+                "falling back to safe default 'unknown'", e,
+            )
+            recon_status_str = "unknown"
+
         cycle_event: dict = {
             "schema_version":           CYCLE_LOG_SCHEMA_VERSION,
             "event":                    "l0_supervisor_cycle",
@@ -207,7 +260,7 @@ async def supervise() -> None:
             "cb_state_consistency":     "unknown",
             "supervisor_unhealthy":     "unknown",
             "soft_mode_trigger_count":  -1,
-            "reconciliation_status":    "phase3",   # populated in Phase 3 wiring
+            "reconciliation_status":    recon_status_str,
             "loop_latency_ms":          -1,
             "ts":                       time.time(),
         }
