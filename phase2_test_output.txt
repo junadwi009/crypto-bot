@@ -1,0 +1,15 @@
+tests/governance/test_signal_generator_audit_coverage.py::test_exception_path_attempts_to_record PASSED [ 98%]
+tests/governance/test_supervisor_hard_exit.py::test_hard_exit_invokes_os_exit_2 PASSED [ 99%]
+tests/governance/test_supervisor_hard_exit.py::test_soft_mode_does_not_exit PASSED [100%]
+
+============================== warnings summary ===============================
+database\models.py:16
+  C:\Users\arjuna.putranto\Downloads\project_dashboard\crypto-bot\.claude\worktrees\inspiring-dijkstra-876e94\database\models.py:16: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    class BaseDBModel(BaseModel):
+
+..\..\..\..\..\..\anaconda3\Lib\site-packages\pandas\core\computation\expressions.py:22
+  C:\Users\arjuna.putranto\anaconda3\Lib\site-packages\pandas\core\computation\expressions.py:22: UserWarning: Pandas requires version '2.10.2' or newer of 'numexpr' (version '2.10.1' currently installed).
+    from pandas.core.computation.check import NUMEXPR_INSTALLED
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+====================== 120 passed, 2 warnings in 32.36s =======================

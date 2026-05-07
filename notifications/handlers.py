@@ -198,12 +198,53 @@ async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── /resume ───────────────────────────────────────────────────────────────────
 
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Resume the bot. Closes P2-R1: any clear of bot_paused must consult
+    the L0 supervisor first. While l0:supervisor_unhealthy is set, resume
+    is refused regardless of operator action — only the supervisor itself
+    may clear the unhealthy flag (after sustained clean cycles).
+    """
     ok, _ = await _check_auth(update)
     if not ok:
         return
 
+    # P2-R1: supervisor authority check before clearing pause state.
+    # See governance/l0_supervisor.resume_authority_check.
+    try:
+        from governance.l0_supervisor import resume_authority_check
+        allowed, reason = await resume_authority_check()
+    except Exception as e:
+        log.error("resume_authority_check raised: %s", e)
+        await update.message.reply_text(
+            "Resume blocked: cannot verify supervisor health "
+            "(check_failed). Contact operator."
+        )
+        return
+
+    if not allowed:
+        log.warning("Telegram /resume refused: %s", reason)
+        await update.message.reply_text(
+            f"Resume BLOCKED by L0 supervisor: {reason}\n\n"
+            f"The supervisor will auto-clear after sustained clean cycles. "
+            f"Investigate the original L0 violation before retrying."
+        )
+        # Audit the refused-resume attempt
+        try:
+            await db.log_event(
+                event_type="resume_blocked_by_supervisor",
+                severity="warning",
+                message=f"Telegram /resume refused: {reason}",
+                data={"reason": reason, "actor": "telegram"},
+            )
+        except Exception:
+            pass
+        return
+
+    # Authority granted — proceed with clearing pause.
+    # NOTE: this still uses the legacy non-prefixed key for now; Phase 3
+    # cleanup migrates this to l0:bot_paused via the supervisor.
     await redis.delete("bot_paused")
-    await db.log_event("bot_resumed", "Bot resumed via Telegram")
+    await db.log_event("bot_resumed", "Bot resumed via Telegram (supervisor authorized)")
     await update.message.reply_text(bot_resumed())
 
 

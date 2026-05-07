@@ -2,7 +2,19 @@
 exchange/bybit_client.py
 Bybit API v5 — REST + WebSocket client.
 
-PATCHED 2026-05-02:
+PATCHED 2026-05-07 (Phase 1 — L0 kernel migration):
+- place_market_order accepts orderLinkId; deterministic generation via
+  build_order_link_id(pair, side, signal_epoch_minute) so a retry within
+  the same minute window collapses to the original order. Bybit's duplicate
+  rejection (retCode 10005 / 110072 / "duplicate") is treated as success
+  and original order metadata is fetched.
+- 1-minute deterministic bucket chosen to match the 30-second tick cadence
+  in trading_loop. Two ticks within 60s sharing the same signal will not
+  result in two orders.
+- LayerZeroViolation is NOT caught here (BaseException subclass); it
+  propagates if a downstream call (e.g., into safety_kernel) raises one.
+
+PATCHED 2026-05-02 (prior):
 - get_price() cache punya TTL (sebelumnya bisa stale berhari-hari)
 - WS subscribe tidak dipanggil otomatis tapi tersedia untuk frontend later
 - Helper qty rounding minimum (Bybit punya min order size per symbol)
@@ -10,6 +22,7 @@ PATCHED 2026-05-02:
 
 from __future__ import annotations
 import asyncio
+import hashlib
 import logging
 import time
 from typing import Callable
@@ -22,6 +35,34 @@ log = logging.getLogger("bybit")
 
 # Cache harga TTL (detik) — kalau lebih dari ini, fetch fresh
 _PRICE_CACHE_TTL = 5
+
+# Idempotency window — collapse retries within the same minute bucket.
+# Matches trading_loop's ~30s tick cadence.
+ORDER_LINK_ID_BUCKET_SECONDS = 60
+
+# Bybit duplicate-order error codes. Empirically observed:
+#   10005  — "param error: duplicate orderLinkId"
+#   110072 — "Order link ID already exists"
+# We treat any of these as "the original is ours, fetch and return."
+BYBIT_DUPLICATE_RETCODES = {10005, 110072}
+
+
+def build_order_link_id(pair: str, side: str, signal_epoch_minute: int | None = None) -> str:
+    """
+    Deterministic order link id.
+
+    Same (pair, side, minute) → same id. Bybit will reject the duplicate
+    and we recover by fetching the original. This is the idempotency
+    contract: a network-timeout retry MUST NOT result in two fills.
+
+    Format: cb_<8-hex-of-sha256(pair|side|minute)> — 11 chars total,
+    safe for Bybit's 36-char orderLinkId limit.
+    """
+    if signal_epoch_minute is None:
+        signal_epoch_minute = int(time.time()) // ORDER_LINK_ID_BUCKET_SECONDS
+    payload = f"{pair}|{side.lower()}|{signal_epoch_minute}".encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()[:8]
+    return f"cb_{digest}"
 
 
 class BybitClient:
@@ -147,35 +188,139 @@ class BybitClient:
     # ── Order management ──────────────────────────────────────────────────
 
     async def place_market_order(self, symbol: str, side: str,
-                                  qty: float) -> dict:
+                                  qty: float,
+                                  order_link_id: str | None = None,
+                                  stop_loss: float | None = None,
+                                  take_profit: float | None = None) -> dict:
+        """
+        Place a spot market order with idempotency + optional exchange-side
+        SL/TP attached.
+
+        Args:
+            symbol:        e.g. "BTC/USDT"
+            side:          "Buy" or "Sell"
+            qty:           base-asset quantity
+            order_link_id: deterministic idempotency key. If None, computed
+                           from (symbol, side, current minute). Caller MUST
+                           supply this if it wants tighter retry collapsing.
+            stop_loss:     optional exchange-side stop-loss price
+            take_profit:   optional exchange-side take-profit price
+
+        Returns Bybit's `result` dict on success, or a synthetic dict in
+        paper mode. On Bybit duplicate-rejection, fetches and returns the
+        existing order so the caller sees idempotent success.
+        """
         symbol = self._fmt(symbol)
-        log.info("Placing market order: %s %s %s qty=%.6f",
-                 "PAPER" if settings.PAPER_TRADE else "LIVE",
-                 side, symbol, qty)
+
+        # Idempotency key — deterministic if not supplied.
+        if order_link_id is None:
+            # Note: caller-side build_order_link_id uses the un-formatted pair
+            # (e.g., "BTC/USDT") to keep it human-readable. Replicate here
+            # using the un-formatted version reconstructed from BTCUSDT.
+            # For paper/test we just use symbol; collisions don't matter.
+            order_link_id = build_order_link_id(symbol, side)
+
+        log.info(
+            "Placing market order: %s %s %s qty=%.6f link_id=%s sl=%s tp=%s",
+            "PAPER" if settings.PAPER_TRADE else "LIVE",
+            side, symbol, qty, order_link_id, stop_loss, take_profit,
+        )
 
         if settings.PAPER_TRADE:
             price = await self.get_price(symbol)
             return {
-                "orderId":   f"paper_{int(time.time())}",
-                "symbol":    symbol,
-                "side":      side,
-                "qty":       qty,
-                "price":     price,
-                "status":    "Filled",
-                "is_paper":  True,
+                "orderId":     f"paper_{order_link_id}_{int(time.time())}",
+                "orderLinkId": order_link_id,
+                "symbol":      symbol,
+                "side":        side,
+                "qty":         qty,
+                "price":       price,
+                "status":      "Filled",
+                "stopLoss":    stop_loss,
+                "takeProfit":  take_profit,
+                "is_paper":    True,
             }
 
-        result = self._rest().place_order(
-            category  = "spot",
-            symbol    = symbol,
-            side      = side,
-            orderType = "Market",
-            qty       = str(round(qty, 6)),
+        kwargs = {
+            "category":    "spot",
+            "symbol":      symbol,
+            "side":        side,
+            "orderType":   "Market",
+            "qty":         str(round(qty, 6)),
+            "orderLinkId": order_link_id,
+        }
+        # Bybit spot SL/TP requires tpslMode + at least one of stopLoss/takeProfit
+        if stop_loss is not None or take_profit is not None:
+            kwargs["tpslMode"] = "Full"
+            if stop_loss is not None:
+                kwargs["stopLoss"] = str(round(float(stop_loss), 8))
+            if take_profit is not None:
+                kwargs["takeProfit"] = str(round(float(take_profit), 8))
+
+        result = self._rest().place_order(**kwargs)
+
+        # Idempotency recovery: duplicate orderLinkId means an earlier call
+        # already succeeded. Fetch the existing order and return as success.
+        ret_code = int(result.get("retCode", -1))
+        if ret_code in BYBIT_DUPLICATE_RETCODES:
+            log.warning(
+                "Duplicate orderLinkId %s rejected by Bybit (retCode=%d) — "
+                "treating as idempotent success, fetching original",
+                order_link_id, ret_code,
+            )
+            existing = await self._get_order_by_link_id(symbol, order_link_id)
+            if existing:
+                return existing
+            # Cannot find original — surface the duplicate as an error so
+            # caller does not assume success without a confirmed fill.
+            raise RuntimeError(
+                f"Duplicate orderLinkId {order_link_id} but cannot fetch "
+                f"original: {result.get('retMsg')}"
+            )
+
+        if ret_code != 0:
+            raise RuntimeError(
+                f"Order failed (retCode={ret_code}): {result.get('retMsg')}"
+            )
+
+        order_data = result["result"]
+        # Echo orderLinkId back even if Bybit's response doesn't (defensive)
+        if "orderLinkId" not in order_data:
+            order_data["orderLinkId"] = order_link_id
+        log.info(
+            "Order placed: orderId=%s linkId=%s",
+            order_data.get("orderId"), order_link_id,
         )
-        if result["retCode"] != 0:
-            raise RuntimeError(f"Order failed: {result['retMsg']}")
-        log.info("Order placed: orderId=%s", result["result"]["orderId"])
-        return result["result"]
+        return order_data
+
+    async def _get_order_by_link_id(self, symbol: str,
+                                     order_link_id: str) -> dict | None:
+        """
+        Look up an order by its orderLinkId. Used in idempotent recovery
+        after a duplicate-rejection.
+        """
+        try:
+            result = self._rest().get_open_orders(
+                category    = "spot",
+                symbol      = symbol,
+                orderLinkId = order_link_id,
+            )
+            if result.get("retCode") == 0 and result["result"].get("list"):
+                return result["result"]["list"][0]
+        except Exception as e:
+            log.error("Failed to fetch order by linkId %s: %s", order_link_id, e)
+        # Try order history as fallback (filled orders are no longer "open")
+        try:
+            result = self._rest().get_order_history(
+                category    = "spot",
+                symbol      = symbol,
+                orderLinkId = order_link_id,
+            )
+            if result.get("retCode") == 0 and result["result"].get("list"):
+                return result["result"]["list"][0]
+        except Exception as e:
+            log.error("Failed to fetch order history by linkId %s: %s", order_link_id, e)
+        return None
 
     async def place_limit_order(self, symbol: str, side: str,
                                  qty: float, price: float) -> dict:

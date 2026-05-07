@@ -2,7 +2,18 @@
 exchange/order_manager.py
 Lifecycle order: buat → pantau → tutup.
 
-PATCHED 2026-05-02:
+PATCHED 2026-05-07 (Phase 1 — L0 kernel migration):
+- open_position now passes signal.stop_loss / signal.take_profit through
+  to bybit.place_market_order so the exchange enforces SL/TP natively.
+  Software-side polling in monitor_open_trades() remains as a fallback
+  but is no longer the primary defense.
+- orderLinkId is built deterministically here from (pair, side, minute)
+  so retries within one minute collapse to a single fill on Bybit.
+- LayerZeroViolation is re-raised explicitly before the broad except
+  in open_position — ensures L0 violations propagate to the supervisor
+  boundary rather than getting logged as ordinary order errors.
+
+PATCHED 2026-05-02 (prior):
 - BUG FIX: PnL calculation untuk SELL — dulu pakai formula long-only
   (current - entry) * qty bahkan kalau side='sell' → flip tanda
 - Notif Telegram saat trade closed (sebelumnya hanya log)
@@ -11,11 +22,13 @@ PATCHED 2026-05-02:
 
 from __future__ import annotations
 import logging
+import time
 
 from config.settings import settings
 from database.client import db
 from database.models import TradeCreate, TradeSignal
-from exchange.bybit_client import bybit
+from exchange.bybit_client import bybit, build_order_link_id, ORDER_LINK_ID_BUCKET_SECONDS
+from governance.exceptions import LayerZeroViolation
 
 log = logging.getLogger("order_manager")
 
@@ -37,10 +50,23 @@ class OrderManager:
             qty = bybit.calc_qty(signal.pair, signal.suggested_size, current_price)
             fee = bybit.calc_fee(signal.suggested_size)
 
+            # Deterministic idempotency key: same (pair, side, minute) →
+            # same orderLinkId. A retry within 60s collapses on Bybit side.
+            signal_minute = int(time.time()) // ORDER_LINK_ID_BUCKET_SECONDS
+            order_link_id = build_order_link_id(
+                signal.pair, signal.action, signal_minute,
+            )
+
+            # Exchange-side SL/TP: pass signal.stop_loss + signal.take_profit
+            # through to Bybit so the exchange enforces them natively.
+            # Software polling in monitor_open_trades() remains as fallback.
             order = await bybit.place_market_order(
-                symbol = signal.pair,
-                side   = "Buy" if signal.action == "buy" else "Sell",
-                qty    = qty,
+                symbol         = signal.pair,
+                side           = "Buy" if signal.action == "buy" else "Sell",
+                qty            = qty,
+                order_link_id  = order_link_id,
+                stop_loss      = signal.stop_loss,
+                take_profit    = signal.take_profit,
             )
 
             exec_price = float(order.get("price") or current_price)
@@ -61,13 +87,16 @@ class OrderManager:
                 message    = f"{signal.action.upper()} {signal.pair} "
                              f"${signal.suggested_size:.2f} @ {exec_price:.4f}",
                 data = {
-                    "trade_id":   trade_id,
-                    "pair":       signal.pair,
-                    "side":       signal.action,
-                    "size_usd":   signal.suggested_size,
-                    "price":      exec_price,
-                    "confidence": signal.confidence,
-                    "source":     signal.source,
+                    "trade_id":      trade_id,
+                    "pair":          signal.pair,
+                    "side":          signal.action,
+                    "size_usd":      signal.suggested_size,
+                    "price":         exec_price,
+                    "confidence":    signal.confidence,
+                    "source":        signal.source,
+                    "order_link_id": order_link_id,
+                    "stop_loss":     signal.stop_loss,
+                    "take_profit":   signal.take_profit,
                 },
             )
 
@@ -80,14 +109,19 @@ class OrderManager:
                     price = exec_price,
                     source= signal.source,
                 )
+            except LayerZeroViolation:
+                raise
             except Exception as e:
                 log.debug("Trade open notif skipped: %s", e)
 
-            log.info("Position opened: %s %s $%.2f @ %.4f (id=%s)",
+            log.info("Position opened: %s %s $%.2f @ %.4f (id=%s linkId=%s)",
                      signal.action, signal.pair, signal.suggested_size,
-                     exec_price, trade_id)
+                     exec_price, trade_id, order_link_id)
             return trade_id
 
+        except LayerZeroViolation:
+            # Critical-path: do NOT log-and-swallow. Propagate to supervisor.
+            raise
         except Exception as e:
             log.error("Failed to open position %s: %s", signal.pair, e)
             await db.log_event(

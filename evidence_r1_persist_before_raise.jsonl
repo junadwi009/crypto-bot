@@ -1,0 +1,4 @@
+{"caller": "engine.signal_generator", "stage": "client_acquired", "ts": "2026-05-07T07:07:27.882220+00:00"}
+{"payload": {"allowed_prefixes": ["l2:"], "attempted_key": "l0:bot_paused", "attempted_op": "set", "caller": "engine.signal_generator", "event": "redis_acl_violation", "schema_version": 1, "ts": 1778137647.8823528}, "stage": "persist_invoked", "ts": "2026-05-07T07:07:27.882365+00:00"}
+{"attempted_key": "l0:bot_paused", "caller": "engine.signal_generator", "is_baseexception": true, "is_exception": false, "stage": "violation_raised_after_persist_and_log", "ts": "2026-05-07T07:07:27.885146+00:00"}
+{"expected": ["persist", "log", "raise"], "order": ["persist", "log", "raise"], "stage": "call_order_summary", "ts": "2026-05-07T07:07:27.885258+00:00", "verdict": "PASS"}

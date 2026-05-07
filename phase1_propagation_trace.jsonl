@@ -1,0 +1,12 @@
+{"ts": "2026-05-07T07:06:59.982223+00:00", "event": "trace_start", "phase": "1", "purpose": "L0 propagation verification"}
+{"ts": "2026-05-07T07:06:59.996381+00:00", "event": "kernel_loaded", "version": "1.0.0", "hash_prefix": "6894df350512a855", "max_risk": 0.02, "news_cap": 1.0}
+{"ts": "2026-05-07T07:06:59.996521+00:00", "event": "kernel_mutation_blocked", "message": "safety_kernel.MAX_RISK_PER_TRADE is L0-immutable; changes require KERNEL_VERSION bump and redeploy"}
+{"ts": "2026-05-07T07:06:59.996620+00:00", "event": "validator_raised", "reason": "position_multiplier 99.0000 outside L0 bounds [0.3, 1.5]", "source_module": "propagation_trace", "recoverable": false, "type": "LayerZeroViolation", "is_baseexception": true, "is_exception": false}
+{"ts": "2026-05-07T07:06:59.996709+00:00", "event": "violation_bypassed_exception_handler", "reached_outer_layer": true, "reason": "position_multiplier 99.0000 outside L0 bounds [0.3, 1.5]"}
+{"ts": "2026-05-07T07:06:59.996760+00:00", "event": "stage_stack_trace_test", "note": "invoking real signal_generator pipeline"}
+{"ts": "2026-05-07T07:07:07.651319+00:00", "event": "invoke_signal_generator_process", "pair": "BTC/USDT"}
+{"ts": "2026-05-07T07:07:08.421434+00:00", "event": "violation_reached_outer_caller", "reason": "trace_probe_injection", "source_module": "engine.position_manager", "propagated_through": ["engine.position_manager.calc_position_size (raise)", "engine.signal_generator.process (re-raise on LayerZeroViolation)", "outer caller (this script)"]}
+{"ts": "2026-05-07T07:07:08.421602+00:00", "event": "traceback_dump"}
+{"ts": "2026-05-07T07:07:08.421703+00:00", "event": "supervisor_boundary_invoked", "simulated": true, "action": "would_set_l0:bot_paused, l0:supervisor_unhealthy, alert SEV-1"}
+{"ts": "2026-05-07T07:07:08.421771+00:00", "event": "soft_mode_continues", "note": "supervisor would log + pause + alert, NOT exit"}
+{"ts": "2026-05-07T07:07:08.421824+00:00", "event": "trace_complete", "verdict": "PASS", "summary": "LayerZeroViolation propagated cleanly to supervisor boundary"}

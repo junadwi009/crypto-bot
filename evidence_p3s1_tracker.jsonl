@@ -1,0 +1,6 @@
+{"actual": 0, "expected": 0, "fixture": "empty_history", "pair": "BTC/USDT", "ts": "2026-05-07T07:54:31.308779+00:00", "verdict": "PASS"}
+{"actual": 3, "expected": 3, "fixture": "3_consecutive_losses", "pair": "BTC/USDT", "ts": "2026-05-07T07:54:31.309566+00:00", "verdict": "PASS"}
+{"actual": 5, "expected": 5, "fixture": "5_consecutive_losses", "pair": "BTC/USDT", "ts": "2026-05-07T07:54:31.310239+00:00", "verdict": "PASS"}
+{"actual": 2, "expected": 2, "fixture": "win_breaks_streak_at_2", "pair": "BTC/USDT", "ts": "2026-05-07T07:54:31.310696+00:00", "verdict": "PASS"}
+{"actual": 1, "expected": 1, "fixture": "breakeven_breaks_streak", "pair": "BTC/USDT", "ts": "2026-05-07T07:54:31.311073+00:00", "verdict": "PASS"}
+{"actual": 3, "expected": 3, "fixture": "filtered_by_pair", "pair": "BTC/USDT", "ts": "2026-05-07T07:54:31.311432+00:00", "verdict": "PASS"}

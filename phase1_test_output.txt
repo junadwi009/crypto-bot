@@ -1,0 +1,65 @@
+tests/governance/test_idempotency_and_sl_tp.py::test_link_id_case_insensitive_side PASSED [  8%]
+tests/governance/test_idempotency_and_sl_tp.py::test_paper_order_includes_link_id_and_sl_tp PASSED [ 10%]
+tests/governance/test_idempotency_and_sl_tp.py::test_paper_order_auto_generates_link_id_if_none PASSED [ 12%]
+tests/governance/test_idempotency_and_sl_tp.py::test_live_order_forwards_sl_tp_and_link_id_to_bybit PASSED [ 14%]
+tests/governance/test_idempotency_and_sl_tp.py::test_duplicate_link_id_returns_existing_order PASSED [ 15%]
+tests/governance/test_idempotency_and_sl_tp.py::test_duplicate_link_id_unable_to_fetch_raises PASSED [ 17%]
+tests/governance/test_idempotency_and_sl_tp.py::test_order_guard_rejects_sell_on_spot PASSED [ 19%]
+tests/governance/test_idempotency_and_sl_tp.py::test_order_guard_accepts_buy_when_state_ok PASSED [ 21%]
+tests/governance/test_layer_zero_propagation.py::test_violation_from_position_manager_propagates_through_signal_generator PASSED [ 22%]
+tests/governance/test_layer_zero_propagation.py::test_violation_from_order_guard_propagates_through_signal_generator PASSED [ 24%]
+tests/governance/test_layer_zero_propagation.py::test_violation_from_news_executor_propagates PASSED [ 26%]
+tests/governance/test_layer_zero_propagation.py::test_violation_from_safety_kernel_directly PASSED [ 28%]
+tests/governance/test_layer_zero_propagation.py::test_synthetic_pipeline_swallow_check PASSED [ 29%]
+tests/governance/test_safety_kernel.py::test_max_risk_per_trade_unchanged PASSED [ 31%]
+tests/governance/test_safety_kernel.py::test_max_daily_drawdown_unchanged PASSED [ 33%]
+tests/governance/test_safety_kernel.py::test_size_cap_unchanged PASSED   [ 35%]
+tests/governance/test_safety_kernel.py::test_min_order_unchanged PASSED  [ 36%]
+tests/governance/test_safety_kernel.py::test_capital_floor_unchanged PASSED [ 38%]
+tests/governance/test_safety_kernel.py::test_max_positions_unchanged PASSED [ 40%]
+tests/governance/test_safety_kernel.py::test_max_orders_per_min_unchanged PASSED [ 42%]
+tests/governance/test_safety_kernel.py::test_news_amp_cap_is_one PASSED  [ 43%]
+tests/governance/test_safety_kernel.py::test_news_safe_default PASSED    [ 45%]
+tests/governance/test_safety_kernel.py::test_constant_mutation_blocked PASSED [ 47%]
+tests/governance/test_safety_kernel.py::test_constant_deletion_blocked PASSED [ 49%]
+tests/governance/test_safety_kernel.py::test_new_attribute_addition_blocked PASSED [ 50%]
+tests/governance/test_safety_kernel.py::test_validate_position_multiplier_in_bounds PASSED [ 52%]
+tests/governance/test_safety_kernel.py::test_validate_position_multiplier_above_max_raises PASSED [ 54%]
+tests/governance/test_safety_kernel.py::test_validate_position_multiplier_below_min_raises PASSED [ 56%]
+tests/governance/test_safety_kernel.py::test_validate_position_multiplier_non_numeric_raises PASSED [ 57%]
+tests/governance/test_safety_kernel.py::test_validate_position_multiplier_none_raises PASSED [ 59%]
+tests/governance/test_safety_kernel.py::test_validate_size_within_cap PASSED [ 61%]
+tests/governance/test_safety_kernel.py::test_validate_size_at_cap PASSED [ 63%]
+tests/governance/test_safety_kernel.py::test_validate_size_above_cap_raises PASSED [ 64%]
+tests/governance/test_safety_kernel.py::test_validate_size_zero_capital_raises PASSED [ 66%]
+tests/governance/test_safety_kernel.py::test_news_factor_below_cap_passes PASSED [ 68%]
+tests/governance/test_safety_kernel.py::test_news_factor_above_cap_clamped PASSED [ 70%]
+tests/governance/test_safety_kernel.py::test_news_factor_negative_clamped_to_zero PASSED [ 71%]
+tests/governance/test_safety_kernel.py::test_news_factor_non_numeric_safe_default PASSED [ 73%]
+tests/governance/test_safety_kernel.py::test_news_factor_nan_safe_default PASSED [ 75%]
+tests/governance/test_safety_kernel.py::test_kernel_hash_is_sha256 PASSED [ 77%]
+tests/governance/test_safety_kernel.py::test_kernel_hash_matches_file PASSED [ 78%]
+tests/governance/test_safety_kernel.py::test_violation_inherits_base_exception_not_exception PASSED [ 80%]
+tests/governance/test_safety_kernel.py::test_violation_bypasses_except_exception PASSED [ 82%]
+tests/governance/test_safety_kernel.py::test_violation_str_is_single_line PASSED [ 84%]
+tests/governance/test_safety_kernel.py::test_violation_context_json_serializable PASSED [ 85%]
+tests/governance/test_secret_guard_phase1.py::test_session_secret_missing_fails_boot PASSED [ 87%]
+tests/governance/test_secret_guard_phase1.py::test_session_secret_too_short_fails_boot PASSED [ 89%]
+tests/governance/test_secret_guard_phase1.py::test_session_secret_placeholder_fails_boot PASSED [ 91%]
+tests/governance/test_secret_guard_phase1.py::test_session_secret_strong_passes PASSED [ 92%]
+tests/governance/test_secret_guard_phase1.py::test_paper_false_without_live_token_forced_to_paper PASSED [ 94%]
+tests/governance/test_secret_guard_phase1.py::test_paper_false_with_correct_live_token_honored PASSED [ 96%]
+tests/governance/test_supervisor_hard_exit.py::test_hard_exit_invokes_os_exit_2 PASSED [ 98%]
+tests/governance/test_supervisor_hard_exit.py::test_soft_mode_does_not_exit PASSED [100%]
+
+============================== warnings summary ===============================
+tests/governance/test_idempotency_and_sl_tp.py::test_order_guard_rejects_sell_on_spot
+  C:\Users\arjuna.putranto\Downloads\project_dashboard\crypto-bot\.claude\worktrees\inspiring-dijkstra-876e94\database\models.py:16: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    class BaseDBModel(BaseModel):
+
+tests/governance/test_layer_zero_propagation.py::test_violation_from_position_manager_propagates_through_signal_generator
+  C:\Users\arjuna.putranto\anaconda3\Lib\site-packages\pandas\core\computation\expressions.py:22: UserWarning: Pandas requires version '2.10.2' or newer of 'numexpr' (version '2.10.1' currently installed).
+    from pandas.core.computation.check import NUMEXPR_INSTALLED
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================= 57 passed, 2 warnings in 15.12s =======================

@@ -193,13 +193,32 @@ async def status_public():
     except Exception:
         tier = "seed"
 
+    # Frontend (Dashboard, header) expects daily_pnl, active_pairs,
+    # open_trades, plus circuit_breaker as an object with .tripped.
+    try:
+        daily_pnl = await db.get_total_pnl(days=1)
+    except Exception:
+        daily_pnl = 0.0
+    try:
+        active_pairs = await db.get_active_pairs()
+    except Exception:
+        active_pairs = []
+    try:
+        open_trades = await db.get_open_trades(is_paper=settings.PAPER_TRADE)
+        open_count  = len(open_trades)
+    except Exception:
+        open_count = 0
+
     bot_status = "stopped" if cb_trip else "paused" if paused else "running"
     return {
         "status":          bot_status,
         "capital":         capital,
         "paper_trade":     settings.PAPER_TRADE,
         "tier":            tier,
-        "circuit_breaker": cb_trip,
+        "daily_pnl":       daily_pnl,
+        "active_pairs":    active_pairs,
+        "open_trades":     open_count,
+        "circuit_breaker": {"tripped": cb_trip},
     }
 
 
@@ -207,25 +226,38 @@ async def status_public():
 
 @router.get("/portfolio/summary")
 async def portfolio_summary(_=Depends(require_auth)):
-    capital   = await db.get_current_capital()
-    open_t    = await db.get_open_trades(is_paper=settings.PAPER_TRADE)
-    win_rate  = await db.get_win_rate(days=30)
-    pnl_30d   = await db.get_total_pnl(days=30)
+    capital      = await db.get_current_capital()
+    open_t       = await db.get_open_trades(is_paper=settings.PAPER_TRADE)
+    win_rate_30  = await db.get_win_rate(days=30)
+    pnl_30       = await db.get_total_pnl(days=30)
+    win_rate_7   = await db.get_win_rate(days=7)
+    pnl_7        = await db.get_total_pnl(days=7)
+    trades_7     = await db.get_trades_for_period(days=7)
+    try:
+        max_dd = await db.get_max_drawdown(days=30)
+    except Exception:
+        max_dd = 0.0
 
     return {
         "capital_usd":    capital,
         "open_positions": len(open_t),
-        "win_rate_30d":   win_rate,
-        "pnl_30d":        pnl_30d,
+        "win_rate_30d":   win_rate_30,
+        "pnl_30d":        pnl_30,
         "tier":           await db.get_current_tier(),
         "paper_trade":    settings.PAPER_TRADE,
+        # Aliases consumed by Dashboard.jsx StatCards (7-day window)
+        "win_rate":       win_rate_7,
+        "total_trades":   len(trades_7),
+        "total_pnl":      pnl_7,
+        "max_drawdown":   max_dd,
     }
 
 
 @router.get("/portfolio/history")
 async def portfolio_history(days: int = 30, _=Depends(require_auth)):
     history = await db.get_portfolio_history(days=days)
-    return {"days": days, "history": history}
+    # Frontend EquityChart and Dashboard EquityMini read `data.data`
+    return {"days": days, "history": history, "data": history}
 
 
 @router.get("/portfolio/allocation")
@@ -301,7 +333,20 @@ async def claude_usage(_=Depends(require_auth)):
     capital = await db.get_current_capital()
     limits  = settings.get_claude_limits(capital)
 
+    # Frontend ClaudeCard expects monthly_cost_usd, estimated_balance,
+    # burn_rate_per_day, days_remaining, mode. Pull them from credit_monitor.
+    try:
+        from brains.credit_monitor import credit_monitor
+        balance   = await credit_monitor.get_balance()
+        burn_day  = await credit_monitor.get_burn_rate(days=7)
+        days_left = await credit_monitor.get_days_remaining()
+        mode      = await credit_monitor.get_claude_mode()
+    except Exception as e:
+        log.warning("credit_monitor lookup failed: %s", e)
+        balance, burn_day, days_left, mode = 0.0, 0.0, 0.0, "normal"
+
     return {
+        # Legacy keys
         "cost_this_month": cost_month,
         "calls_today": {
             "haiku":  haiku_today,
@@ -310,20 +355,67 @@ async def claude_usage(_=Depends(require_auth)):
         },
         "limits": limits,
         "spending_limit": settings.ANTHROPIC_SPENDING_LIMIT,
+        # Frontend-expected keys
+        "monthly_cost_usd":   round(cost_month, 4),
+        "estimated_balance":  round(float(balance or 0), 2),
+        "burn_rate_per_day":  round(float(burn_day or 0), 4),
+        "days_remaining":     float(days_left or 0),
+        "mode":               mode or "normal",
     }
 
 
 @router.get("/opus/memory")
 async def opus_memory(weeks: int = 8, _=Depends(require_auth)):
     memory = await db.get_recent_opus_memory(weeks=weeks)
-    return {"weeks": weeks, "memory": memory}
+
+    # Build evaluations payload that OpusPanel.jsx expects.
+    evaluations: list[dict] = []
+    for m in memory or []:
+        actions = m.get("actions_required") or []
+        if isinstance(actions, str):
+            try:
+                actions = json.loads(actions)
+            except Exception:
+                actions = []
+        params_updated = m.get("params_updated") or {}
+        if isinstance(params_updated, str):
+            try:
+                params_updated = json.loads(params_updated)
+            except Exception:
+                params_updated = {}
+        # Hide the _auto meta key from the dashboard params view
+        params_clean = {
+            k: v for k, v in params_updated.items() if k != "_auto"
+        } if isinstance(params_updated, dict) else {}
+
+        evaluations.append({
+            "week_start": str(m.get("week_start") or ""),
+            "week_end":   str(m.get("week_end")   or ""),
+            "summary": {
+                "win_rate":     float(m.get("win_rate")     or 0),
+                "total_pnl":    float(m.get("total_pnl")    or 0),
+                "total_trades": int(m.get("total_trades")   or 0),
+                "sharpe_ratio": float(m.get("sharpe_ratio") or 0),
+                "max_drawdown": float(m.get("max_drawdown") or 0),
+                "assessment":   m.get("assessment") or "",
+            },
+            "actions_required": actions,
+            "params_updated":   params_clean,
+            "patterns_found":   m.get("patterns_found") or [],
+            "token_cost":       float(m.get("token_cost") or 0),
+        })
+
+    return {"weeks": weeks, "memory": memory, "evaluations": evaluations}
 
 
 @router.get("/opus/latest-actions")
 async def opus_latest_actions(_=Depends(require_auth)):
     memory = await db.get_recent_opus_memory(weeks=1)
     if not memory:
-        return {"actions": [], "week_start": None}
+        return {
+            "actions": [], "week_start": None,
+            "has_critical": False, "p0": [], "p1": [], "p2": [],
+        }
     latest = memory[0]
     actions = latest.get("actions_required") or []
     if isinstance(actions, str):
@@ -331,9 +423,18 @@ async def opus_latest_actions(_=Depends(require_auth)):
             actions = json.loads(actions)
         except Exception:
             actions = []
+
+    p0 = [a for a in actions if isinstance(a, dict) and a.get("priority") == "P0"]
+    p1 = [a for a in actions if isinstance(a, dict) and a.get("priority") == "P1"]
+    p2 = [a for a in actions if isinstance(a, dict) and a.get("priority") == "P2"]
+
     return {
-        "actions":    actions[:5],
-        "week_start": latest.get("week_start"),
+        "actions":      actions[:5],
+        "week_start":   latest.get("week_start"),
+        "has_critical": bool(p0),
+        "p0":           p0,
+        "p1":           p1,
+        "p2":           p2,
     }
 
 
@@ -400,8 +501,15 @@ async def get_price(pair_dash: str, _=Depends(require_auth)):
     from exchange.bybit_client import bybit
     pair = pair_dash.replace("-", "/")
     try:
-        price = await bybit.get_price(pair)
-        return {"pair": pair, "price": price}
+        ticker = await bybit.get_ticker(pair)
+        # Bybit returns price24hPcnt as a decimal (0.0123 = +1.23%).
+        change_pct = float(ticker.get("change_24h") or 0) * 100
+        return {
+            "pair":            pair,
+            "price":           float(ticker.get("last") or 0),
+            "change_24h_pct":  round(change_pct, 4),
+            "volume_24h":      float(ticker.get("volume_24h") or 0),
+        }
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"price_unavailable: {e}")
 
@@ -409,15 +517,102 @@ async def get_price(pair_dash: str, _=Depends(require_auth)):
 @router.get("/ticker/all")
 async def ticker_all(_=Depends(require_auth)):
     from exchange.bybit_client import bybit
-    active = await db.get_active_pairs()
-    out = {}
-    for pair in active:
+    # Show the same default set the frontend ticker tape renders even if
+    # no pair is active yet — so the tape isn't blank in early stages.
+    active = set(await db.get_active_pairs())
+    universe = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+    for p in active:
+        if p not in universe:
+            universe.append(p)
+
+    tickers: list[dict] = []
+    for pair in universe:
         try:
             t = await bybit.get_ticker(pair)
-            out[pair] = t
+            tickers.append({
+                "symbol":          pair,
+                "price":           float(t.get("last") or 0),
+                "change_24h_pct":  round(float(t.get("change_24h") or 0) * 100, 4),
+                "volume_24h":      float(t.get("volume_24h") or 0),
+                "is_active":       pair in active,
+            })
         except Exception:
             pass
-    return {"tickers": out}
+    return {"tickers": tickers}
+
+
+def _compute_indicators(candles: list[dict]) -> list[dict]:
+    """Add `time`, `isUp`, RSI(14) and Bollinger(20, 2σ) fields per candle."""
+    if not candles:
+        return candles
+
+    closes = [float(c.get("close") or 0) for c in candles]
+
+    # --- Wilder RSI(14) ---
+    period = 14
+    rsis: list[float | None] = [None] * len(closes)
+    if len(closes) > period:
+        gains_sum = 0.0
+        losses_sum = 0.0
+        for i in range(1, period + 1):
+            delta = closes[i] - closes[i - 1]
+            gains_sum  += max(delta, 0.0)
+            losses_sum += max(-delta, 0.0)
+        avg_gain = gains_sum  / period
+        avg_loss = losses_sum / period
+        rs = (avg_gain / avg_loss) if avg_loss > 0 else float("inf")
+        rsis[period] = 100.0 if avg_loss == 0 else 100 - (100 / (1 + rs))
+        for i in range(period + 1, len(closes)):
+            delta = closes[i] - closes[i - 1]
+            gain  = max(delta, 0.0)
+            loss  = max(-delta, 0.0)
+            avg_gain = (avg_gain * (period - 1) + gain) / period
+            avg_loss = (avg_loss * (period - 1) + loss) / period
+            if avg_loss == 0:
+                rsis[i] = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                rsis[i] = 100 - (100 / (1 + rs))
+
+    # --- Bollinger Bands(20, 2) ---
+    bb_period = 20
+    bb_k      = 2.0
+    bb_mid:   list[float | None] = [None] * len(closes)
+    bb_upper: list[float | None] = [None] * len(closes)
+    bb_lower: list[float | None] = [None] * len(closes)
+    for i in range(bb_period - 1, len(closes)):
+        window = closes[i - bb_period + 1: i + 1]
+        mean   = sum(window) / bb_period
+        var    = sum((x - mean) ** 2 for x in window) / bb_period
+        std    = var ** 0.5
+        bb_mid[i]   = mean
+        bb_upper[i] = mean + bb_k * std
+        bb_lower[i] = mean - bb_k * std
+
+    enriched: list[dict] = []
+    prev_close = None
+    for i, c in enumerate(candles):
+        ts = c["timestamp"]
+        if ts > 1e12:
+            ts = ts // 1000
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        # Use HH:MM as the human-readable time label
+        time_label = dt.strftime("%H:%M") if c is candles[0] or True else dt.isoformat()
+        cur_close = float(c.get("close") or 0)
+        is_up = (cur_close >= prev_close) if prev_close is not None else (cur_close >= float(c.get("open") or 0))
+        prev_close = cur_close
+
+        enriched.append({
+            **c,
+            "iso_utc":  dt.isoformat(),
+            "time":     time_label,
+            "isUp":     bool(is_up),
+            "rsi":      round(rsis[i], 2)      if rsis[i]      is not None else None,
+            "bbMid":    round(bb_mid[i], 6)    if bb_mid[i]    is not None else None,
+            "bbUpper":  round(bb_upper[i], 6)  if bb_upper[i]  is not None else None,
+            "bbLower":  round(bb_lower[i], 6)  if bb_lower[i]  is not None else None,
+        })
+    return enriched
 
 
 @router.get("/ohlcv/{pair_dash}")
@@ -427,11 +622,7 @@ async def ohlcv(pair_dash: str, interval: str = "15", limit: int = 80,
     pair = pair_dash.replace("-", "/")
     try:
         candles = await bybit.get_ohlcv(pair, interval=interval, limit=limit)
-        for c in candles:
-            ts = c["timestamp"]
-            if ts > 1e12:
-                ts = ts // 1000
-            c["iso_utc"] = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        candles = _compute_indicators(candles)
         return {"pair": pair, "interval": interval, "candles": candles}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"ohlcv_error: {e}")
@@ -544,17 +735,18 @@ async def manual_capital_inject(request: Request, _=Depends(require_auth)):
         new_capital = current + amount
 
         from database.models import PortfolioSnapshot
+        infra = await db.get_infra_balance()
+        active_pairs = await db.get_active_pairs()
         snap = PortfolioSnapshot(
-            snapshot_date  = date.today(),
-            total_capital  = new_capital,
-            trading_capital= new_capital,
-            infra_fund     = await db.get_infra_balance(),
-            open_positions = len(
-                await db.get_open_trades(is_paper=settings.PAPER_TRADE)
-            ),
-            daily_pnl      = 0,
-            tier           = settings.get_tier(new_capital),
-            paper_trade    = settings.PAPER_TRADE,
+            snapshot_date    = date.today(),
+            total_capital    = new_capital,
+            trading_capital  = max(0, new_capital - infra),
+            infra_reserve    = infra,
+            emergency_buffer = round(new_capital * 0.05, 4),
+            current_tier     = settings.get_tier(new_capital),
+            active_pairs     = active_pairs,
+            daily_pnl        = 0,
+            drawdown_pct     = 0,
         )
         await db.save_portfolio_snapshot(snap)
 

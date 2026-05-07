@@ -1,0 +1,4 @@
+{"stage": "begin", "test": "second invocation while lock held returns UNKNOWN + alerts SEV-1", "ts": "2026-05-07T07:07:21.223058+00:00"}
+{"expected_status": "unknown", "returned_status": "unknown", "stage": "second_invocation_completed", "ts": "2026-05-07T07:07:22.359910+00:00"}
+{"alert_count": 1, "first_alert": "SEV-1 reconciliation lock payload INVALID\ninvocation_id: 4bfbbb22b9914a7c90d43a437fa9e6df\nraw_truncated: prior_invocation_token_xyz\nNOT auto-cleared. Human review required.", "stage": "sev1_alerts_emitted", "ts": "2026-05-07T07:07:22.359935+00:00"}
+{"stage": "complete", "ts": "2026-05-07T07:07:22.359947+00:00", "verdict": "PASS"}
