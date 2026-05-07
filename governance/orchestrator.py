@@ -90,7 +90,7 @@ redis = acl.for_module(__name__)
 # ─────────────────────────────────────────────────────────────────
 # Versioning (Council constraint 13: monotonic, never reused)
 # ─────────────────────────────────────────────────────────────────
-ORCHESTRATOR_VERSION = "0.2.0-observe"
+ORCHESTRATOR_VERSION = "0.3.0-observe-with-cl"
 
 # LAYER_INPUTS_SCHEMA_VERSION HISTORY (append-only, never edit prior entries)
 #
@@ -100,8 +100,15 @@ ORCHESTRATOR_VERSION = "0.2.0-observe"
 #    rule_signal, haiku_signal, sonnet_signal, guard_state,
 #    computed_size, computed_sl, computed_tp, stage_reached, pair}
 #
+# v2 (Phase 3 Step 1, 2026-05-07):
+#   v1 keys plus:
+#     consecutive_losses (int)  — per-pair streak count from
+#                                  governance.consecutive_losses tracker.
+#                                  Used by counterfactual veto branch.
+#   v1 semantics unchanged; v2 is a strict superset.
+#
 # Future bumps append below with rationale. NEVER mutate prior entries.
-LAYER_INPUTS_SCHEMA_VERSION = 1
+LAYER_INPUTS_SCHEMA_VERSION = 2
 
 # Observe-only flag — Phase 3 promotion is the ONLY way this flips.
 ORCHESTRATOR_OBSERVE_ONLY = os.getenv("ORCHESTRATOR_OBSERVE_ONLY", "true").lower() != "false"
@@ -277,11 +284,13 @@ class Orchestrator:
         proposed_sl: float | None,
         proposed_tp: float | None,
     ) -> dict:
-        """Snapshot all inputs needed for replay. Schema v1.
+        """Snapshot all inputs needed for replay. Schema v2 (Phase 3 Step 1).
 
         Required keys (Council mandate constraint 6):
           schema_version, kernel_hash, kernel_version, orchestrator_version,
           governance_mode, reconciliation_raw, reconciliation_implication.
+
+        Phase 3 Step 1 adds: consecutive_losses (int).
         """
         recon_raw = await recon_last_status()
         recon_implication = RECON_TO_GOVERNANCE[recon_raw]
@@ -296,6 +305,21 @@ class Orchestrator:
         except Exception:
             mode = DEFAULT_GOVERNANCE_MODE
 
+        # Phase 3 Step 1: consecutive-losses tracker. Lazy import so the
+        # orchestrator module is loadable in test environments where the
+        # tracker may be absent. LayerZeroViolation propagates.
+        try:
+            from governance.consecutive_losses import get_consecutive_loss_count
+            cl_count = await get_consecutive_loss_count(pair)
+        except RedisACLViolation:
+            raise
+        except LayerZeroViolation:
+            raise
+        except Exception as e:
+            log.error("orchestrator: consecutive_losses lookup failed for %s: %s",
+                      pair, e)
+            cl_count = 0
+
         return {
             "schema_version":             LAYER_INPUTS_SCHEMA_VERSION,
             "kernel_hash":                L0.KERNEL_HASH[:16],
@@ -307,6 +331,8 @@ class Orchestrator:
                                           ),
             "reconciliation_raw":         recon_raw.value,
             "reconciliation_implication": recon_implication,
+            # Phase 3 Step 1: per-pair loss streak
+            "consecutive_losses":         int(cl_count or 0),
             # Pipeline snapshot
             "pair":          pair,
             "stage_reached": pipeline_state.get("stage_reached", "unknown"),
@@ -333,8 +359,16 @@ class Orchestrator:
           - reconciliation_divergent → mode = frozen
           - reconciliation_stale     → mode = restricted (size × 0.5)
 
-        Veto-list ordering is deterministic. Ordering is part of the R3
-        hash identity (constraint: stable list ordering preserved).
+        Phase 3 Step 1 veto (additive — also recorded only):
+          - consecutive_losses >= CONSECUTIVE_LOSS_THRESHOLD on this pair
+            → mode = restricted (size × 0.5) when no stricter mode active.
+            Veto string: f"consecutive_losses_{N}_on_{pair}".
+            Mode escalation only — frozen wins over restricted.
+
+        Veto-list ordering is deterministic: recon → losses. Ordering is
+        part of the R3 hash identity (constraint: stable list ordering
+        preserved). DO NOT reorder these branches without bumping
+        ORCHESTRATOR_VERSION and adding a HISTORY entry.
 
         Returns dict with action, size_usd, size_scale, mode, vetoes.
         """
@@ -358,6 +392,25 @@ class Orchestrator:
             mode = "restricted"
             scale = 0.5
             size = size * scale
+
+        # Phase 3 Step 1: consecutive-losses veto.
+        # Append to layer_vetoes whenever the threshold is met AND the
+        # request is actionable (ignored for hold-requests since they are
+        # already non-actions). Recorded even if recon already vetoed —
+        # the audit trail captures all applicable vetoes.
+        # Mode only escalates restrictiveness: frozen > restricted > normal.
+        try:
+            cl_count = int(layer_inputs.get("consecutive_losses", 0) or 0)
+        except (TypeError, ValueError):
+            cl_count = 0
+        cl_pair = layer_inputs.get("pair", "unknown")
+        from governance.consecutive_losses import CONSECUTIVE_LOSS_THRESHOLD
+        if cl_count >= CONSECUTIVE_LOSS_THRESHOLD and requested_action != "hold":
+            vetoes.append(f"consecutive_losses_{cl_count}_on_{cl_pair}")
+            if mode == "normal":
+                mode = "restricted"
+                scale = 0.5
+                size = float(proposed_size_usd or 0) * scale
 
         # Holds skip the rest of the counterfactual; their action is hold by definition.
         if requested_action == "hold":
