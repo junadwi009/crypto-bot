@@ -31,8 +31,13 @@ class RedisClient:
     async def get(self, key: str) -> str | None:
         return await self._get().get(key)
 
-    async def set(self, key: str, value: str):
-        await self._get().set(key, value)
+    async def set(self, key: str, value: str, **kwargs):
+        # Forward kwargs (ex, nx, px, xx, keepttl, exat, pxat) to redis-py.
+        # Required by:
+        #   - governance/l0_supervisor heartbeat (uses ex=)
+        #   - governance/reconciliation single-flight lock (uses nx=, ex=)
+        # Return the result so SET NX semantics ("acquired" boolean) work.
+        return await self._get().set(key, value, **kwargs)
 
     async def setex(self, key: str, ttl: int, value: str):
         await self._get().setex(key, ttl, value)
