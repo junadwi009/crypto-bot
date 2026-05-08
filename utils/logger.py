@@ -80,3 +80,9 @@ def setup_logging():
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.WARNING)
     logging.getLogger("pybit").setLevel(logging.WARNING)
+    # HTTP/2 transport stack used internally by httpx → supabase-py.
+    # `hpack` floods ~40 DEBUG lines per request when root level=DEBUG;
+    # `h2` is its parent protocol library. Silence at WARNING.
+    logging.getLogger("hpack").setLevel(logging.WARNING)
+    logging.getLogger("h2").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
