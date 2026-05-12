@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import inspect
+from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -56,6 +57,19 @@ class BotScheduler:
             id="circuit_breaker_check",
             name="Circuit breaker monitor",
             max_instances=1,
+        )
+        # Reconciliation — Phase-2 designed worker. Writes l1:reconciliation_status
+        # which the orchestrator (and L0 supervisor cycle log) consume.
+        # Hourly cadence: well under the 25h stale threshold; sub-ms no-op in
+        # paper mode. First run at boot so observe-only review starts with a
+        # fresh recon status rather than the UNKNOWN default.
+        s.add_job(
+            self._wrap(self._reconcile),
+            IntervalTrigger(hours=1),
+            id="reconciliation",
+            name="Reconciliation cycle (hourly)",
+            max_instances=1,
+            next_run_time=datetime.now(WIB),
         )
 
         # ── Harian ────────────────────────────────────────────────────
@@ -214,6 +228,11 @@ class BotScheduler:
     async def _monitor_circuit_breaker(self):
         from schedulers.daily_tasks import monitor_circuit_breaker
         await monitor_circuit_breaker()
+
+    async def _reconcile(self):
+        from governance import reconciliation
+        status = await reconciliation.reconcile()
+        log.info("Reconciliation cycle complete: status=%s", status.value)
 
     async def _supabase_ping(self):
         from schedulers.daily_tasks import check_supabase_activity
